@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./images/mkpivm.png" width="30%" height="30%">
+  <img src="./images/mkpivm.png" width="40%" height="40%">
 </p>
 
 # mkPIVM
