@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./images/mkpivm.png" width="40%" height="40%">
+  <img src="./images/mkpivm.png" width="30%" height="30%">
   <br>
   <a href="./research/mkpivm-research.pdf">Read</a> the research paper.
 </p>
