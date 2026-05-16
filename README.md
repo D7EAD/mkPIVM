@@ -394,3 +394,9 @@ cmake --build build --config Release --target mkpivm
 * The lifter does not currently cover SSE/AVX register moves, atomics, CMPXCHG, RDMSR, or privileged instructions. Pack mode is the workaround for shellcodes using those.
 * Authenticode signatures on `--embed-into` output are invalidated. The PE checksum is zeroed.
 * Output blobs require RWX at runtime because in-place decryption writes back to the blob's own pages. Most loaders that run shellcode allocate RWX anyway. There is no plan to move to RX-only because the trade buys RX at the cost of a PEB walk and a `VirtualAlloc` call, which is probably a worse signature than the RWX page it replaces.
+* Virtualizing stageless payloads via default mode is not supported yet, as they are horribly complicated to wrap in the VM; prefer `--pack + --ranges`.
+
+# Notes
+* This project is largely proof-of-concept research. If it is well-received, I will extend it as requested and welcome contribution. However, it seemed stable for the tested samples.
+* If your shellcode doesn't work, and you don't want to place it in an Issue, then unfortunately I can't help you. This was tested on Sliver, Cobalt Strike 4.12, MSF, Havoc, and a few other undisclosed samples.
+* In my testing, injection of the VM into live processes worked fine. However, when it comes to embedding into PEs, this was not testedwith commercial software like MS Word, but it probably works. If not, will fix.
