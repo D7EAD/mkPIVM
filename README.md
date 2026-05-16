@@ -102,7 +102,7 @@ The runtime nonce trick is the key anti-memory-scan move: the handler table sits
 
 ## Packer mode: `--pack`
 
-The opposite tradeoff. The lifter does not run. The original shellcode goes into the data island encrypted, and the IR is a single synthetic `JMP_NATIVE imm=0`. The prologue intentionally skips the data-island decrypt that default mode runs eagerly. Instead, the first time the lone JMP_NATIVE handler fires, it decrypts the data island in place, sets a sentinel byte, then transfers control to byte 0 of the now-plaintext shellcode. The shellcode runs natively from there.
+The opposite tradeoff. The lifter does not run. The original shellcode goes into the data island encrypted, and the IR is a single synthetic `JMP_NATIVE imm=0`. The prologue intentionally skips the data-island decrypt that default mode runs eagerly. Instead, the first time the lone JMP_NATIVE handler fires, it decrypts the data island in place, sets a marker byte, then transfers control to byte 0 of the now-plaintext shellcode. The shellcode runs natively from there.
 
 Works on any shellcode, regardless of lifter coverage. Useful for stageless cobalt, exotic syscall-heavy payloads, anything too large or weird to virtualize. Loses the per-instruction virtualization defense but keeps the full per-seed VM polymorphism on the wrapper.
 
