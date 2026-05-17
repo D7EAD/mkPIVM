@@ -20,7 +20,7 @@ Your PIVM is hot and ready. That's the simplest path. Several other modes vary h
 
 # Showcase
 
-I got the receipts. You can see a video of mkPIVM in action below, fully virtualizing a Meterpreter stager, injecting into explorer.exe, and us capturing a callback. Of course this is just an example, and mkPIVM can be applied to much more, assuming the instructions in the shellcode are supported. If they aren't, make an Issue, send me the shellcode, I got you.
+I got the receipts. You can see a video of mkPIVM in action below, fully virtualizing a Meterpreter stager (vanilla btw), injecting into explorer.exe, and us capturing a callback. Of course this is just an example, and mkPIVM can be applied to much more, assuming the instructions in the shellcode are supported. If they aren't, make an Issue, send me the shellcode, I got you.
 
 See it [here](https://github.com/D7EAD/mkPIVM/raw/refs/heads/main/media/mkpivm-showcase.mp4). Hosted in ./media, can't embed sadly.
 
