@@ -45,11 +45,6 @@ There was careful attention paid to the entropy telemetry of the output of this 
 | `rpcrt4.dll` | 1,162,672 | 6.2405 |
 | `ntdll.dll` | 2,522,104 | 6.1934 |
 | `v.bin` | 29,229 | **6.0442** |
-| `advapi32.dll` | 753,560 | 5.9880 |
-| `ws2_32.dll` | 534,568 | 5.9734 |
-| `gdi32.dll` | 187,456 | 5.5510 |
-| `user32.dll` | 1,877,472 | 5.4194 |
-| `ole32.dll` | 1,683,280 | 5.3216 |
 
 ## Modes at a glance
 
