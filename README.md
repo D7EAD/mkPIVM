@@ -417,7 +417,7 @@ cmake --build build --config Release --target mkpivm
 
 ## Known limits
 
-* Range mode for cobalt stagers does not work as a standalone leaf. The stager's helper functions depend on caller-supplied register state that the runner does not provide. Full virtualization or `--pack` are the routes that actually beacon. Documented in memory.
+* Range mode for cobalt stagers does not work as a standalone leaf. The stager's helper functions depend on caller-supplied register state that the runner does not provide. Full virtualization or `--pack` are the routes that actually beacon.
 * x86 threaded detour requires the target to either lack ASLR or accept added base relocation entries, which the tool emits when present. If the target's BASERELOC data dir is malformed or absent, the tool falls back to inline mode.
 * The lifter does not currently cover SSE/AVX register moves, atomics, CMPXCHG, RDMSR, or privileged instructions. Pack mode is the workaround for shellcodes using those.
 * Authenticode signatures on `--embed-into` output are invalidated. The PE checksum is zeroed.
