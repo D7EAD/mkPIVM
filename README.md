@@ -32,6 +32,25 @@ Here is the VirusTotal report for that exact virtualized sample (as of 05/17/202
 
 <img src="./images/packed.png">
 
+There was careful attention paid to the entropy telemetry of the output of this tool, which results in shellcode of entropy less than typical Windows WinAPI DLLs, such as ntdll.dll or kernel32.dll. The entropy comparison is about...
+
+| File | Bytes | Entropy |
+|------|-------|---------|
+| `p_m64.bin` (--pack mbox x64) | 3,969 | **7.1181** |
+| `msvcrt.dll` | 699,888 | 6.5319 |
+| `wininet.dll` | 2,724,528 | 6.4934 |
+| `shell32.dll` | 7,839,992 | 6.3639 |
+| `kernel32.dll` | 836,232 | 6.3597 |
+| `crypt32.dll` | 1,538,632 | 6.3010 |
+| `rpcrt4.dll` | 1,162,672 | 6.2405 |
+| `ntdll.dll` | 2,522,104 | 6.1934 |
+| `v.bin` (default-virt mbox x64) | 29,229 | **6.0442** |
+| `advapi32.dll` | 753,560 | 5.9880 |
+| `ws2_32.dll` | 534,568 | 5.9734 |
+| `gdi32.dll` | 187,456 | 5.5510 |
+| `user32.dll` | 1,877,472 | 5.4194 |
+| `ole32.dll` | 1,683,280 | 5.3216 |
+
 ## Modes at a glance
 
 | Mode | Flags | What changes |
