@@ -32,7 +32,7 @@ Here is the VirusTotal report for that exact virtualized sample (as of 05/17/202
 
 <img src="./images/packed.png">
 
-There was careful attention paid to the entropy telemetry of the output of this tool, which results in shellcode of entropy less than typical Windows WinAPI DLLs, such as ntdll.dll or kernel32.dll. The entropy comparison is about...
+There was careful attention paid to the entropy telemetry of the output of this tool, which results in shellcode of entropy less than typical Windows WinAPI DLLs (outside of packing mode), such as ntdll.dll or kernel32.dll. The entropy comparison is about...
 
 | File | Bytes | Entropy |
 |------|-------|---------|
