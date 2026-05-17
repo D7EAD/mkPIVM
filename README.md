@@ -28,6 +28,10 @@ Here is the VirusTotal report for that exact virtualized sample (as of 05/17/202
 
 <img src="./images/vt.png">
 
+...and the packed version, not even virtualized.
+
+<img src="./images/packed.png">
+
 ## Modes at a glance
 
 | Mode | Flags | What changes |
