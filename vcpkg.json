@@ -1,0 +1,9 @@
+{
+  "name": "mkpivm",
+  "version-string": "1.0.0",
+  "description": "virtualizing your shellcode for fun and profit",
+  "dependencies": [
+    "zydis",
+    "fmt"
+  ]
+}
