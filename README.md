@@ -24,6 +24,10 @@ I got the receipts. You can see a video of mkPIVM in action below, fully virtual
 
 See it [here](https://github.com/D7EAD/mkPIVM/raw/refs/heads/main/media/mkpivm-showcase.mp4). Hosted in ./media, can't embed sadly.
 
+Here is the VirusTotal report for that exact virtualized sample.
+
+<img src="./images/vt.png">
+
 ## Modes at a glance
 
 | Mode | Flags | What changes |
