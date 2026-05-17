@@ -36,7 +36,7 @@ There was careful attention paid to the entropy telemetry of the output of this 
 
 | File | Bytes | Entropy |
 |------|-------|---------|
-| `p_m64.bin` (--pack mbox x64) | 3,969 | **7.1181** |
+| `p_m64.bin` | 3,969 | **7.1181** |
 | `msvcrt.dll` | 699,888 | 6.5319 |
 | `wininet.dll` | 2,724,528 | 6.4934 |
 | `shell32.dll` | 7,839,992 | 6.3639 |
@@ -44,7 +44,7 @@ There was careful attention paid to the entropy telemetry of the output of this 
 | `crypt32.dll` | 1,538,632 | 6.3010 |
 | `rpcrt4.dll` | 1,162,672 | 6.2405 |
 | `ntdll.dll` | 2,522,104 | 6.1934 |
-| `v.bin` (default-virt mbox x64) | 29,229 | **6.0442** |
+| `v.bin` | 29,229 | **6.0442** |
 | `advapi32.dll` | 753,560 | 5.9880 |
 | `ws2_32.dll` | 534,568 | 5.9734 |
 | `gdi32.dll` | 187,456 | 5.5510 |
