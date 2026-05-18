@@ -1,4 +1,4 @@
-> Ugly bug showed its face, currently fixing. Check for 1.0.1 shortly.
+> VERY ugly bug showed its face, currently fixing. Check for 1.0.1 shortly.
 
 <p align="center">
   <img src="./images/mkpivm.png" width="30%" height="30%">
