@@ -8,7 +8,9 @@
 
 Feed it raw shellcode. It emits another raw blob: a small virtual machine that interprets a lifted, encrypted-at-rest version of your original instructions. The output is itself position-independent code and runs anywhere the original shellcode would, from a remote-thread loader to a code cave detour. Every per-seed knob varies independently: cipher family, register slot layout, opcode-to-handler permutation, dispatcher topology, junk-gadget pattern, IR obfuscation insertion points. Two builds from the same input share fewer than a hundred coincidental bytes out of tens of kilobytes.
 
-Why: native shellcode is signature-trivial. Wrapping it in a per-instance VM with a per-instance cipher leaves nothing useful at rest, and lifting the instructions to bytecode puts another wall between disk bytes and any disassembler that knows what x86 looks like. As far as I can tell from a literature sweep, no public tool ships exactly this pipeline: raw PIC in, raw polymorphic VM PIC out. So, I mentioned that in the research paper it demanded.
+Why: native shellcode is signature-trivial. Wrapping it in a per-instance VM with a per-instance cipher leaves nothing useful at rest, and lifting the instructions to bytecode puts another wall between disk bytes and any disassembler that knows what x86 looks like. As far as I can tell from a literature sweep, no public tool ships exactly this pipeline: raw PIC in, raw polymorphic VM PIC out. So, I mentioned that in the research paper it demanded. To be honest, if I am right about no one having done this (publicly) before, and I am pretty confident, I am surprised. _Nonetheless, enjoy._
+
+> I have a lot of new and exciting offensive security contributions in the works, all of which stem from the concept of PIVMs. Stay tuned.
 
 ## Quick start
 
@@ -20,9 +22,31 @@ Your PIVM is hot and ready. That's the simplest path. Several other modes vary h
 
 # Showcase
 
-I got the receipts. You can see a video of mkPIVM in action below, fully virtualizing a Meterpreter stager, injecting into explorer.exe, and us capturing a callback. Of course this is just an example, and mkPIVM can be applied to much more, assuming the instructions in the shellcode are supported. If they aren't, make an Issue, send me the shellcode, I got you.
+I got the receipts. You can see a video of mkPIVM in action below, fully virtualizing a Meterpreter stager (vanilla btw), injecting into explorer.exe, and us capturing a callback. Of course this is just an example, and mkPIVM can be applied to much more, assuming the instructions in the shellcode are supported. If they aren't, make an Issue, send me the shellcode, I got you.
 
 See it [here](https://github.com/D7EAD/mkPIVM/raw/refs/heads/main/media/mkpivm-showcase.mp4). Hosted in ./media, can't embed sadly.
+
+Here is the VirusTotal report for that exact virtualized sample (as of 05/17/2026).
+
+<img src="./images/vt.png">
+
+...and the packed version, not even virtualized, notably higher entropy.
+
+<img src="./images/packed.png">
+
+There was careful attention paid to the entropy telemetry of the output of this tool, which results in shellcode of entropy less than typical Windows WinAPI DLLs (outside of packing mode), such as ntdll.dll or kernel32.dll. The entropy comparison is about...
+
+| File | Bytes | Entropy |
+|------|-------|---------|
+| `p_m64.bin` | 3,969 | **7.1181** |
+| `msvcrt.dll` | 699,888 | 6.5319 |
+| `wininet.dll` | 2,724,528 | 6.4934 |
+| `shell32.dll` | 7,839,992 | 6.3639 |
+| `kernel32.dll` | 836,232 | 6.3597 |
+| `crypt32.dll` | 1,538,632 | 6.3010 |
+| `rpcrt4.dll` | 1,162,672 | 6.2405 |
+| `ntdll.dll` | 2,522,104 | 6.1934 |
+| `v.bin` | 29,229 | **6.0442** |
 
 ## Modes at a glance
 
@@ -395,7 +419,7 @@ cmake --build build --config Release --target mkpivm
 
 ## Known limits
 
-* Range mode for cobalt stagers does not work as a standalone leaf. The stager's helper functions depend on caller-supplied register state that the runner does not provide. Full virtualization or `--pack` are the routes that actually beacon. Documented in memory.
+* Range mode for cobalt stagers does not work as a standalone leaf. The stager's helper functions depend on caller-supplied register state that the runner does not provide. Full virtualization or `--pack` are the routes that actually beacon.
 * x86 threaded detour requires the target to either lack ASLR or accept added base relocation entries, which the tool emits when present. If the target's BASERELOC data dir is malformed or absent, the tool falls back to inline mode.
 * The lifter does not currently cover SSE/AVX register moves, atomics, CMPXCHG, RDMSR, or privileged instructions. Pack mode is the workaround for shellcodes using those.
 * Authenticode signatures on `--embed-into` output are invalidated. The PE checksum is zeroed.
