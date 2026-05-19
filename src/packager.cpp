@@ -213,7 +213,7 @@ namespace mkpivm {
         }
     }
 
-    // runs the IR through the codecs and hands back raw plaintext bytecode.
+    // runs the IR through the codecs and hands back raw plaintext bytecode
     static std::vector<std::uint8_t> encode_bytecode(const IRProgram& prog, const VMConfig& vm, const CodecRegistry& codecs) {
         BytecodeBuilder bb;
 
