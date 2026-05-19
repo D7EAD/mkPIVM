@@ -10,8 +10,6 @@ Feed it raw shellcode. It emits another raw blob: a small virtual machine that i
 
 Why: native shellcode is signature-trivial. Wrapping it in a per-instance VM with a per-instance cipher leaves nothing useful at rest, and lifting the instructions to bytecode puts another wall between disk bytes and any disassembler that knows what x86 looks like. As far as I can tell from a literature sweep, no public tool ships exactly this pipeline: raw PIC in, raw polymorphic VM PIC out. So, I mentioned that in the research paper it demanded. To be honest, if I am right about no one having done this (publicly) before, and I am pretty confident, I am surprised. _Nonetheless, enjoy._
 
-> I have a lot of new and exciting offensive security contributions in the works, all of which stem from the concept of PIVMs. Stay tuned.
-
 <a href="#notes">Jump</a> to bottom.
 
 ## Quick start
@@ -434,8 +432,6 @@ cmake --build build --config Release --target mkpivm
 * In my testing, injection of the VM into live processes worked fine. However, when it comes to embedding into PEs, this was not tested with commercial software like MS Word, only synthetic tests, but it probably works. If not, will fix.
 
 # Plans
-* Release more badass PIVM-based offensive security tooling (just you wait).
-* Place more granular control over PIVM internals in the hands of operators and developers from the CLI.
 * Provide a C++ library interface into PIVM for developers to automate their shellcode and payload creation pipeline.
 
 # Contributing
