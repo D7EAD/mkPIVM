@@ -463,7 +463,7 @@ namespace mkpivm {
             // a self-pointer needs its own entry stub so the eventual native
             // `call reg` doesnt fly into the int3 fill. dormant for now,
             // lifter side of the pattern detect isnt wired up yet, see
-            // feedback_cobalt_stager_range_limit memory note
+            // feedback_cobalt_stager_range_limit mental note
             std::vector<std::pair<std::uint32_t /*va_off*/, std::uint32_t /*stub_idx*/>> rip_via_call_stubs;
             {
                 std::unordered_set<std::uint64_t> seen;
