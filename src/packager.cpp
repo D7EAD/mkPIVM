@@ -167,7 +167,7 @@ namespace mkpivm {
             splits.push_back({bi, target_id});
         }
 
-        // apply splits in reverse so earlier indices stay valid.
+        // apply splits in reverse so earlier indices stay valid
         for (auto it = splits.rbegin(); it != splits.rend(); ++it) {
             const std::size_t bi      = it->blk_idx;
             const std::uint32_t tgt_id = it->target_id;
