@@ -18,6 +18,7 @@ namespace mkpivm {
         const ZydisDecodedInstruction& insn;
         const ZydisDecodedOperand*     ops;
         const CFGBuilder&              cfg;
+        IRProgram*                     prog;  // stash rip-via-call targets here
 
         // emitted IRInsns carry an optional FlagsOp tag. JCC SHOULD read the tag
         // that the previous flag-setting insn left behind.

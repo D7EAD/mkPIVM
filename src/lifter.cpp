@@ -311,6 +311,7 @@ namespace mkpivm {
                     insn,
                     ops,
                     cfg,
+                    &prog,
                 };
 
                 const auto* lf = find(insn.mnemonic);
@@ -346,6 +347,18 @@ namespace mkpivm {
                 const std::uint64_t src_pc  = blk.insns.empty() ? cb.start_va : blk.insns.back().src_pc;
                 auto& ir = builder.push(IROp::BR, Width::Q);
                 ir.target_va = next_va;
+                ir.src_pc    = src_pc;
+            }
+            else if (need_terminator) {
+                // last cfg block in a range mode lift falls off the end of
+                // the lifted region. without a terminator dispatch_tail
+                // happily fetches past the end of bytecode, looks up garbage
+                // in the handler table and lands on something stupid. drop
+                // a JMP_NATIVE to cb.end_va so we exit clean instead.
+                const std::uint64_t src_pc = blk.insns.empty() ? cb.start_va : blk.insns.back().src_pc;
+                IRInsn& ir   = builder.push(IROp::JMP_NATIVE, Width::Q);
+                ir.ops[0]    = Imm{static_cast<std::int64_t>(cb.end_va), Width::Q};
+                ir.op_count  = 1;
                 ir.src_pc    = src_pc;
             }
 
@@ -902,7 +915,7 @@ namespace mkpivm {
                 auto& ir = b.push(IROp::CALL_VM, Width::Q);
                 ir.target_va = abs;
                 ir.return_va = ret_va;
-            } 
+            }
             else {
                 auto& ir = b.push(IROp::CALL_NATIVE, Width::Q);
                 ir.add(Imm{static_cast<std::int64_t>(abs), Width::Q});
@@ -1043,9 +1056,9 @@ namespace mkpivm {
             default: break;
         }
 
-        // detect REP / REPE / REPNE.
+        // detect REP,REPE, REPNE.
         bool has_rep = false;
-        for (std::uint8_t i = 0; i < ctx.insn.attributes ? 1 : 0; ++i) {}  // attributes is a bitset
+        for (std::uint8_t i = 0; i < ctx.insn.attributes ? 1 : 0; ++i) {} // attributes is a bitset
 
         if (ctx.insn.attributes & ZYDIS_ATTRIB_HAS_REP)   has_rep = true;
         if (ctx.insn.attributes & ZYDIS_ATTRIB_HAS_REPE)  has_rep = true;

@@ -13,6 +13,11 @@ namespace mkpivm {
         static std::unordered_map<const X86Emitter*, X86PrologueOrder> g_x86_prologue_orders;
     }
 
+    const std::vector<std::uint8_t>* prologue_order_for(const X86Emitter& e) {
+        auto it = g_x86_prologue_orders.find(&e);
+        return it == g_x86_prologue_orders.end() ? nullptr : &it->second.order;
+    }
+
     void VMCodeGen::emit_prologue(X86Emitter& e, std::size_t /*data_island_size*/) {
         X86PrologueOrder po;
         if (!cached_nv_order_x86_set_) {
@@ -107,10 +112,10 @@ namespace mkpivm {
         // mult/add constants into VMState 
         std::uint64_t mult = 0, add = 0;
         switch (vm_.cipher_kind()) {
-            case CipherKind::ARX:         mult = 0;                          add = vm_.cipher_k1(); break;
-            case CipherKind::LcgSub:      mult = 0x5851F42D4C957F2DULL;      add = vm_.cipher_k1(); break;
-            case CipherKind::SBoxAdd:     mult = 0x100000001B3ULL;           add = vm_.cipher_k1(); break;
-            case CipherKind::FeistelByte: mult = vm_.cipher_k1();            add = vm_.cipher_k2(); break;
+            case CipherKind::ARX:         mult = 0;                     add = vm_.cipher_k1(); break;
+            case CipherKind::LcgSub:      mult = 0x5851F42D4C957F2DULL; add = vm_.cipher_k1(); break;
+            case CipherKind::SBoxAdd:     mult = 0x100000001B3ULL;      add = vm_.cipher_k1(); break;
+            case CipherKind::FeistelByte: mult = vm_.cipher_k1();       add = vm_.cipher_k2(); break;
         }
 
         constexpr std::int32_t kCipherAddOff  = 0;
@@ -151,9 +156,16 @@ namespace mkpivm {
         x86_self_locate(e, cfg.handler_base, FixupKind::HandlerTable);
         x86_self_locate(e, cfg.ip, FixupKind::Bytecode);
 
-        // VM_RSP = state_ptr - 4, top of the shadow stack right below VMState.
-        e.mov_reg_reg(rx::rax, cfg.state_ptr, true);
-        e.sub_reg_imm32(rx::rax, 4, true);
+        // VM_RSP = state_ptr - 4 - headroom. headroom reserves room above
+        // VM_SP for lifted code with positive [esp+disp]/[ebp+disp] reads.
+        // fixed that weird ass bug where 1/N for large shellcode would
+        // remain constant.
+        {
+            const std::uint32_t hr_raw = vm_.vm_sp_headroom();
+            const std::uint32_t hr = (hr_raw + 15u) & ~15u;
+            e.mov_reg_reg(rx::rax, cfg.state_ptr, true);
+            e.sub_reg_imm32(rx::rax, static_cast<std::int32_t>(4u + hr), true);
+        }
         e.mov_mem_reg(
             cfg.state_ptr,
             static_cast<std::int32_t>(st.regs_base + vm_.slot_of_xreg(XReg::SP) * 8),
@@ -238,10 +250,10 @@ namespace mkpivm {
         // data-region decrypt
         const std::uint32_t cinit32 = static_cast<std::uint32_t>(vm_.cipher_init_state());
 
-        // scratch_a/scratch_b shuffle
+        // counter_reg = third_volatile, cipher_state in rbx
         std::uint8_t counter_reg = rx::rax;
-        for (std::uint8_t r : {rx::rax, rx::rcx, rx::rdx}) {
-            if (r != cfg.scratch_a && r != cfg.scratch_b) { counter_reg = r; break; }
+        for (auto v : {rx::rax, rx::rcx, rx::rdx}) {
+            if (v != cfg.scratch_a && v != cfg.scratch_b) { counter_reg = v; break; }
         }
 
         auto emit_decrypt_loop_x86 = [&](FixupKind kind, std::uint32_t byte_count) {
@@ -329,6 +341,25 @@ namespace mkpivm {
                 rx::rax,
                 true
             );
+
+            // dump lo+hi dword into the blob slot so entry 2+ can recover
+            // the nonce. per-entry VMState lives on stack and dies between
+            // entries, same retarded story as x64.
+            e.mov_reg_mem(
+                rx::rax,
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86,
+                true
+            );
+            x86_self_locate(e, cfg.scratch_b, FixupKind::RuntimeNonce);
+            e.mov_mem_reg(cfg.scratch_b, 0, rx::rax, true);
+            e.mov_reg_mem(
+                rx::rax,
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86 + 4,
+                true
+            );
+            e.mov_mem_reg(cfg.scratch_b, 4, rx::rax, true);
         }
 
         emit_decrypt_loop_x86(FixupKind::HandlerTable, 256 * 4);
@@ -377,12 +408,30 @@ namespace mkpivm {
         }
         e.bind(lbl_skip_decrypts_x86);
 
-        // reset cipher_state and ip for bytecode dispatch
+        // copy blob nonce into VMState slot, every entry, no exceptions.
+        // same shit as x64. without this entry 2 reads stack garbage and
+        // dispatch lookups go straight into the weeds.
         {
-            e.mov_reg_imm32(cfg.scratch_a, static_cast<std::int32_t>(cinit32), true);
-            e.mov_reg_reg(cfg.cipher_state, cfg.scratch_a, true);
-            x86_self_locate(e, cfg.ip, FixupKind::Bytecode);
+            x86_self_locate(e, cfg.scratch_b, FixupKind::RuntimeNonce);
+            e.mov_reg_mem(rx::rax, cfg.scratch_b, 0, true);
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86,
+                rx::rax,
+                true
+            );
+            e.mov_reg_mem(rx::rax, cfg.scratch_b, 4, true);
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86 + 4,
+                rx::rax,
+                true
+            );
         }
+
+        // set ip to bytecode start. cipher_state reset deferred to the very
+        // end of emit_state_init
+        x86_self_locate(e, cfg.ip, FixupKind::Bytecode);
 
         // data_island_base via self-locate, points at the now-plaintext bytes.
         x86_self_locate(e, rx::rax, FixupKind::DataIsland);
@@ -464,6 +513,10 @@ namespace mkpivm {
             rx::rax,
             true
         );
+
+        // cipher_state reset
+        e.mov_reg_imm32(cfg.scratch_a, static_cast<std::int32_t>(cinit32), true);
+        e.mov_reg_reg(cfg.cipher_state, cfg.scratch_a, true);
     }
 
     // x86 version of --ranges hybrid mode
@@ -760,6 +813,10 @@ namespace mkpivm {
         // deferred data-island-decrypt flag
         off_.data_island_init_flag = e.size();
         e.u8(vm_.pack_mode() ? 0 : 1);
+
+        // blob mirror of the runtime nonce, same dumbass story as x64
+        off_.runtime_nonce_slot = e.size();
+        for (int i = 0; i < 8; ++i) e.u8(0);
 
         emit_all_handlers(e);
         emit_exit_handler(e);

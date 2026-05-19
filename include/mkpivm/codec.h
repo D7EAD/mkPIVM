@@ -32,6 +32,12 @@ namespace mkpivm {
                                  // decrypt. fires once on first native-handler
                                  // entry, keeps the big decrypt body out of the
                                  // prologue.
+        RuntimeNonce       = 14, // 8-byte blob slot for the runtime nonce.
+                                 // had this in VMState first like a dumbass,
+                                 // but VMState lives on the host stack and
+                                 // dies between range entries, so entry 2
+                                 // read garbage and dispatch XORed the
+                                 // handler table with shit.
     };
 
     // one codec per IR op family. subclasses define the bytecode shape via

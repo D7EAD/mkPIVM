@@ -50,6 +50,14 @@ namespace {
             "                        these under 'coroutine candidates'. no lift-time check\n"
             "                        yet, the packager-time cfg can't reliably tell these\n"
             "                        from mid-exec-exit ranges.\n"
+            "  --range-leak-nvs      opt-in. JMP_NATIVE imm-cleanup splats VMState NV slots\n"
+            "                        back over the prologue stack saves so lifted writes to\n"
+            "                        ebx/ebp/esi/edi and r12-r15 on x64 actually survive\n"
+            "                        into the surrounding native bytes. dont flip this on a\n"
+            "                        function-shaped range or mid-flow escapes will trash\n"
+            "                        the caller's nvs. use it for straight-line partial\n"
+            "                        lifts where downstream native bytes need to see what\n"
+            "                        the lifted code wrote.\n"
             "  --pack                packer mode: don't lift the input. wrap it as encrypted\n"
             "                        data carried by the per-seed polymorphic vm: cipher,\n"
             "                        reg shuffle, handler-table encryption, all of it. at\n"
@@ -180,11 +188,10 @@ namespace {
         out.reserve(c.size() * 3 / 4 + 2);
         std::size_t i = 0;
         for (; i + 4 <= c.size(); i += 4) {
-            const std::uint32_t n =
-                (std::uint32_t(lut[static_cast<unsigned char>(c[i])])     << 18) |
-                (std::uint32_t(lut[static_cast<unsigned char>(c[i + 1])]) << 12) |
-                (std::uint32_t(lut[static_cast<unsigned char>(c[i + 2])]) << 6)  |
-                 std::uint32_t(lut[static_cast<unsigned char>(c[i + 3])]);
+            const std::uint32_t n = (std::uint32_t(lut[static_cast<unsigned char>(c[i])])     << 18) |
+                                    (std::uint32_t(lut[static_cast<unsigned char>(c[i + 1])]) << 12) |
+                                    (std::uint32_t(lut[static_cast<unsigned char>(c[i + 2])]) << 6)  |
+                                     std::uint32_t(lut[static_cast<unsigned char>(c[i + 3])]);
 
             out.push_back(static_cast<std::uint8_t>((n >> 16) & 0xFF));
             out.push_back(static_cast<std::uint8_t>((n >> 8)  & 0xFF));
@@ -688,7 +695,7 @@ namespace {
         for (; i + 3 <= v.size(); i += 3) {
             const std::uint32_t n = (std::uint32_t(v[i])     << 16) |
                                     (std::uint32_t(v[i + 1]) << 8)  |
-                                    std::uint32_t(v[i + 2]);
+                                     std::uint32_t(v[i + 2]);
             s.push_back(tbl[(n >> 18) & 63]);
             s.push_back(tbl[(n >> 12) & 63]);
             s.push_back(tbl[(n >> 6) & 63]);
@@ -811,7 +818,10 @@ int main(int argc, char** argv) {
             } 
             else if (a == "--pack") {
                 opt.pack_mode = true;
-            } 
+            }
+            else if (a == "--range-leak-nvs") {
+                opt.range_leak_nvs = true;
+            }
             else if (a == "--embed-into" && i + 1 < argc) {
                 embed_target = argv[++i];
             } 

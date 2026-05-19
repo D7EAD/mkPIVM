@@ -34,6 +34,7 @@ namespace mkpivm {
             const std::uint16_t over = cur % align;
             return over ? static_cast<std::uint16_t>(cur + (align - over)) : cur;
         };
+        
         auto sprinkle_gap = [&](std::uint16_t cur)->std::uint16_t {
             return cur + static_cast<std::uint16_t>(rng.uniform(0, 7));
         };
@@ -97,12 +98,15 @@ namespace mkpivm {
             regs_.scratch_b     = nv[5];
         }
         else {
-            // win32 only has 4 nv gprs: ebx, esi, edi, ebp.
+            // win32 only has 4 nv gprs. ebx, esi, edi, ebp. dispatcher takes
+            // 3 of them for state_ptr/ip/handler_base out of rsi,rdi,rbp,
+            // and we pin cipher_state to rbx
             std::array<std::uint8_t, 3> nv32{rx::rsi, rx::rdi, rx::rbp};
             shuffle_in_place(nv32, rng);
             regs_.state_ptr    = nv32[0];
             regs_.ip           = nv32[1];
             regs_.handler_base = nv32[2];
+            regs_.cipher_state = rx::rbx;
 
             // scratch_a/b are volatile eax/ecx/edx. they're recomputed at the
             // top of every handler so volatility across native calls is fine.
@@ -132,9 +136,8 @@ namespace mkpivm {
         shuffle_in_place(sbox_, rng);
         for (std::size_t i = 0; i < 256; ++i) sbox_inv_[sbox_[i]] = static_cast<std::uint8_t>(i);
 
-        prologue_ = static_cast<PrologueStyle>(rng.pick(3));
-        dispatch_ = static_cast<DispatchStyle>(rng.pick(2));
-
+        prologue_           = static_cast<PrologueStyle>(rng.pick(3));
+        dispatch_           = static_cast<DispatchStyle>(rng.pick(2));
         shadow_stack_bytes_ = static_cast<std::uint32_t>(rng.uniform(2048, 8192) & ~0xFu);
         junk_density_       = static_cast<std::uint8_t>(rng.pick(4));
 
@@ -146,6 +149,7 @@ namespace mkpivm {
             "RETNATIVE","PUSH","POP","XCHG","ZEXT","SEXT","BSWAP","SETCC","NOP","EXIT",
             "LOOP","CDQE","STOSB","LODSB","MOVSB","REP","DF","IMUL","MUL","IDIV","DIV"
         };
+
         for (auto* f : kFamilies) {
             const std::uint32_t v = rng.pick(3); // default 3 variants per family
             family_to_variant_[f] = v;
@@ -186,8 +190,7 @@ namespace mkpivm {
         return base.derive(k);
     }
 
-    void VMConfig::encrypt_inplace(std::vector<std::uint8_t>& bc,
-                                   const std::vector<std::size_t>& block_starts) const {
+    void VMConfig::encrypt_inplace(std::vector<std::uint8_t>& bc, const std::vector<std::size_t>& block_starts) const {
         std::uint64_t st = cipher_init_;
         const std::uint64_t k1 = cipher_k1_;
         const std::uint64_t k2 = cipher_k2_;

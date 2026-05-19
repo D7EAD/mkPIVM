@@ -13,7 +13,12 @@
 #include <vector>
 
 namespace mkpivm {
-    // emits the PIC scaffolding around the codec handlers 
+    // grab the prologue NV-push order for an emitter. codecs that wanna leak
+    // VM NV regs back over the stack saves need to know what's in what slot.
+    const std::vector<std::uint8_t>* prologue_order_for(const X64Emitter& e);
+    const std::vector<std::uint8_t>* prologue_order_for(const X86Emitter& e);
+
+    // emits the PIC scaffolding around the codec handlers
     class VMCodeGen {
         public:
             VMCodeGen(const VMConfig& vm, const CodecRegistry& codecs, SeedRng& rng);
@@ -49,8 +54,15 @@ namespace mkpivm {
                 // place, sets it after pls no doubling
                 std::size_t init_flag{0};
 
-                // separate one-byte marker for the lazy data-island decrypt 
+                // separate one-byte marker for the lazy data-island decrypt
                 std::size_t data_island_init_flag{0};
+
+                // 8-byte blob mirror of the runtime nonce. computed once via
+                // rdtsc^cipher_init on first state_init, copied into the
+                // per-entry VMState slot every entry after. VMState dies with
+                // the stack between range entries so the old VMState-only
+                // scheme handed dispatch random stack garbage for entry 2.
+                std::size_t runtime_nonce_slot{0};
             };
 
             const Offsets& offsets() const noexcept { return off_; }
