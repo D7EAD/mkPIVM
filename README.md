@@ -432,8 +432,6 @@ cmake --build build --config Release --target mkpivm
 * In my testing, injection of the VM into live processes worked fine. However, when it comes to embedding into PEs, this was not tested with commercial software like MS Word, only synthetic tests, but it probably works. If not, will fix.
 
 # Plans
-* Release more badass PIVM-based offensive security tooling (just you wait).
-* Place more granular control over PIVM internals in the hands of operators and developers from the CLI.
 * Provide a C++ library interface into PIVM for developers to automate their shellcode and payload creation pipeline.
 
 # Contributing
