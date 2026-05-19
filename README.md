@@ -1,4 +1,4 @@
-> bug fix ready, will release tomorrow
+> bug fix ready, will release today
 
 <p align="center">
   <img src="./images/mkpivm.png" width="30%" height="30%">
