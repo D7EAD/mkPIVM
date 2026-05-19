@@ -1,4 +1,5 @@
 #include "mkpivm/codec.h"
+#include "mkpivm/vm_codegen.h"
 #include "mkpivm/x86_emit.h"
 
 namespace mkpivm {
@@ -639,8 +640,7 @@ namespace mkpivm {
     }
 
     // effective-address helper 
-    static void emit_x86_mem_addr(X86Emitter& e, const VMConfig& vm,
-                                  std::uint8_t out_reg) {
+    static void emit_x86_mem_addr(X86Emitter& e, const VMConfig& vm, std::uint8_t out_reg) {
         const auto& r = vm.dispatcher_regs();
         const auto regs_base = static_cast<std::int32_t>(vm.state_layout().regs_base);
 
@@ -878,7 +878,7 @@ namespace mkpivm {
             setcc_to_valreg(cc::ns);
         });
         
-        // B / NB / L / NL: cmp flag_a, flag_b.
+        // B,NB,L,NL: cmp flag_a, flag_b.
         auto cmp_ab_and_set = [&](std::uint8_t cc_code) {
             e.mov_reg_mem(
                 valreg,
@@ -922,7 +922,7 @@ namespace mkpivm {
         emit_dispatch_tail(e, vm);
     }
 
-    // STOSB / SCASB / MOVSB: byte string ops on esi/edi. 
+    // STOSB,SCASB,MOVSB: byte string ops on esi/edi. 
     void StosbCodec::emit_handler(X86Emitter& e, const VMConfig& vm) const {
         const auto& r = vm.dispatcher_regs();
         const auto regs_base = static_cast<std::int32_t>(vm.state_layout().regs_base);
@@ -1594,7 +1594,6 @@ namespace mkpivm {
         emit_dispatch_tail(e, vm);
     }
 
-    // PUSH / POP on the VM shadow stack via the VM_SP slot.
     // PUSH: VM_RSP -= 4, [VM_RSP] = value. POP: value = [VM_RSP], VM_RSP += 4.
     void PushCodec::emit_handler(X86Emitter& e, const VMConfig& vm) const {
         const auto& r = vm.dispatcher_regs();
@@ -1906,11 +1905,11 @@ namespace mkpivm {
             x86_self_locate(e, r.ip, FixupKind::DataIsland);
             x86_self_locate(e, r.scratch_b, FixupKind::DataIsland);
 
-            // counter. pick a volatile the decrypt loop's body doesn't use
-            std::uint8_t counter_reg = rx::rax;
-            for (std::uint8_t rr : {rx::rax, rx::rcx, rx::rdx}) {
-                if (rr != r.scratch_a && rr != r.scratch_b) { counter_reg = rr; break; }
-            }
+            // counter. third_volatile is free here because fetch_byte_dec only
+            // touches scratch_a + cipher_state, and the deferred decrypt block
+            // runs before valreg-using handler body. rbx now holds cipher_state
+            // for x86, so we can't use it as the counter
+            const std::uint8_t counter_reg = third_volatile(r);
             e.mov_reg_imm32(counter_reg, static_cast<std::int32_t>(vm.data_island_size()), true);
 
             auto lbl_loop = e.new_label();
@@ -2140,6 +2139,38 @@ namespace mkpivm {
                 true
             );
 
+            // --range-leak-nvs, opt-in. see the x64 sibling, same dumb story.
+            if (vm.range_leak_nvs()) if (const auto* order = prologue_order_for(e)) {
+                auto host_to_xreg = [](std::uint8_t reg) -> XReg {
+                    if (reg == rx::rbx) return XReg::BX;
+                    if (reg == rx::rbp) return XReg::BP;
+                    if (reg == rx::rdi) return XReg::DI;
+                    if (reg == rx::rsi) return XReg::SI;
+                    return XReg::Invalid;
+                };
+                for (std::size_t i = 0; i < order->size(); ++i) {
+                    const std::uint8_t nv_reg = (*order)[i];
+                    const XReg xr = host_to_xreg(nv_reg);
+                    if (xr == XReg::Invalid) continue;
+                    // scratch_a points at the caller_retaddr stack slot
+                    // (aligned_frame + 20 above saved_native_rsp). NV[i]
+                    // (= po.order[i]) sits at saved_rsp + aligned + 4*(4-i),
+                    // i.e. scratch_a - 4*(i+1).
+                    e.mov_reg_mem(
+                        r.scratch_b,
+                        r.state_ptr,
+                        static_cast<std::int32_t>(vm.state_layout().regs_base + vm.slot_of_xreg(xr) * 8),
+                        true
+                    );
+                    e.mov_mem_reg(
+                        r.scratch_a,
+                        -static_cast<std::int32_t>(4 * (i + 1)),
+                        r.scratch_b,
+                        true
+                    );
+                }
+            }
+
             // eax = VM_AX for the native return-value convention.
             e.mov_reg_mem(
                 rx::rax,
@@ -2200,8 +2231,7 @@ namespace mkpivm {
     }
 
     // shifts: Shl/Shr/Sar/Rol/Ror by imm8 or by CL via vreg.
-    static void emit_shift_handler_x86(X86Emitter& e, const VMConfig& vm,
-                                       std::uint8_t op_ext) {
+    static void emit_shift_handler_x86(X86Emitter& e, const VMConfig& vm, std::uint8_t op_ext) {
         const auto& r = vm.dispatcher_regs();
         const auto regs_base = static_cast<std::int32_t>(vm.state_layout().regs_base);
         const std::uint8_t valreg = third_volatile(r);

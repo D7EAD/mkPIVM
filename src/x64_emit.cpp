@@ -345,8 +345,7 @@ namespace mkpivm {
         throw Error("mov_reg_mem_size: bad size");
     }
 
-    void X64Emitter::mov_mem_reg_size(std::uint8_t base, std::int32_t disp, std::uint8_t src,
-                                      std::uint8_t size_bytes) {
+    void X64Emitter::mov_mem_reg_size(std::uint8_t base, std::int32_t disp, std::uint8_t src, std::uint8_t size_bytes) {
         if (size_bytes == 8) {
             mov_mem_reg(
                 base,
@@ -927,8 +926,7 @@ namespace mkpivm {
         u8(0x63); emit_modrm(3, d & 7, s & 7);
     }
 
-    void X64Emitter::mov_reg_seg_disp32(std::uint8_t dst, std::uint8_t seg,
-                                        std::int32_t disp, bool w64) {
+    void X64Emitter::mov_reg_seg_disp32(std::uint8_t dst, std::uint8_t seg, std::int32_t disp, bool w64) {
         // REX.W + 65 for gs / 64 for fs, then 8B /r with ModR/M + disp32.
         if (seg == 1)      u8(0x64);
         else if (seg == 2) u8(0x65);

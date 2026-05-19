@@ -621,8 +621,7 @@ namespace mkpivm {
         }
     }
 
-    EmbedResult embed_vm_blob(Span<std::uint8_t> vm_blob, Arch arch,
-                              const EmbedOptions& opt) {
+    EmbedResult embed_vm_blob(Span<std::uint8_t> vm_blob, Arch arch, const EmbedOptions& opt) {
         PeView pe = parse_pe(read_file_bytes(opt.target_pe_path));
 
         // PE arch must match the vm blob.

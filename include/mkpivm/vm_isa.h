@@ -113,13 +113,23 @@ namespace mkpivm {
             bool range_mode() const noexcept { return range_mode_; }
             void set_range_mode(bool on) noexcept { range_mode_ = on; }
 
-            // true when this blob is a --pack wrapper 
+            // true when this blob is a --pack wrapper
             bool pack_mode() const noexcept { return pack_mode_; }
             void set_pack_mode(bool on) noexcept { pack_mode_ = on; }
+
+            // --range-leak-nvs opt-in. tell JMP_NATIVE imm-cleanup to splat
+            // VMState NV slots back over the prologue stack saves so lifted
+            // ebx/ebp/esi/edi writes survive into the surrounding native.
+            bool range_leak_nvs() const noexcept { return range_leak_nvs_; }
+            void set_range_leak_nvs(bool on) noexcept { range_leak_nvs_ = on; }
 
             // size of the data island in bytes
             std::uint32_t data_island_size() const noexcept { return data_island_size_; }
             void set_data_island_size(std::uint32_t n) noexcept { data_island_size_ = n; }
+
+            // this shit was so fucking retarded i dont even wanna talk abt it
+            std::uint32_t vm_sp_headroom() const noexcept { return vm_sp_headroom_; }
+            void set_vm_sp_headroom(std::uint32_t n) noexcept { vm_sp_headroom_ = n; }
 
             // cipher state and keys
             std::uint64_t cipher_init_state() const noexcept { return cipher_init_; }
@@ -174,7 +184,9 @@ namespace mkpivm {
             std::uint8_t                  junk_density_{0};
             bool                          range_mode_{false};
             bool                          pack_mode_{false};
+            bool                          range_leak_nvs_{false};
             std::uint32_t                 data_island_size_{0};
+            std::uint32_t                 vm_sp_headroom_{0};
 
             std::unordered_map<std::string, std::uint8_t>  family_to_opcode_;
             std::unordered_map<std::uint8_t, std::string>  op_to_key_;

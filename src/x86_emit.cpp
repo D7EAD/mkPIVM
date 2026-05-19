@@ -394,8 +394,7 @@ namespace mkpivm {
         ); 
     }
 
-    static void x86_alu_ri(X86Emitter& e, std::uint8_t op_ext,
-                           std::uint8_t dst, std::int32_t imm) {
+    static void x86_alu_ri(X86Emitter& e, std::uint8_t op_ext, std::uint8_t dst, std::int32_t imm) {
         if (dst >= 8) throw Error("x86 emitter: no r8+");
         e.u8(0x81);
         e.emit_modrm(3, op_ext, dst & 7);
@@ -456,8 +455,7 @@ namespace mkpivm {
         ); 
     }
 
-    static void x86_shift_ri(X86Emitter& e, std::uint8_t op_ext,
-                             std::uint8_t dst, std::uint8_t s) {
+    static void x86_shift_ri(X86Emitter& e, std::uint8_t op_ext, std::uint8_t dst, std::uint8_t s) {
         if (dst >= 8) throw Error("x86 emitter: no r8+");
         e.u8(0xC1);
         e.emit_modrm(3, op_ext, dst & 7);
@@ -522,7 +520,7 @@ namespace mkpivm {
     void X86Emitter::ror_reg_cl  (std::uint8_t d, bool) { x86_shift_cl(*this, 1, d); }
 
     // inc/dec have short 0x40+r and 0x48+r forms in 32-bit mode but we stick to
-    // the FF or F7 form so the encoding matches the x64 emitter.
+    // the FF or F7 form so the encoding matches the x64 emitter
     void X86Emitter::inc_reg(std::uint8_t r, bool) {
         if (r >= 8) throw Error("x86 emitter: no r8+");
         u8(0xFF); emit_modrm(3, 0, r & 7);

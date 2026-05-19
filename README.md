@@ -12,6 +12,8 @@ Why: native shellcode is signature-trivial. Wrapping it in a per-instance VM wit
 
 > I have a lot of new and exciting offensive security contributions in the works, all of which stem from the concept of PIVMs. Stay tuned.
 
+<a href="#notes">Jump</a> to bottom.
+
 ## Quick start
 
 ```
@@ -430,3 +432,14 @@ cmake --build build --config Release --target mkpivm
 * This project is largely proof-of-concept research. If it is well-received, I will extend it as requested and welcome contribution. However, it seemed stable for the tested samples.
 * If your shellcode doesn't work, and you don't want to place it in an Issue, then unfortunately I can't help you. This was tested on Sliver, Cobalt Strike 4.12, MSF, Havoc, and a few other undisclosed samples.
 * In my testing, injection of the VM into live processes worked fine. However, when it comes to embedding into PEs, this was not tested with commercial software like MS Word, only synthetic tests, but it probably works. If not, will fix.
+
+# Plans
+* Release more badass PIVM-based offensive security tooling (just you wait).
+* Place more granular control over PIVM internals in the hands of operators and developers from the CLI.
+* Provide a C++ library interface into PIVM for developers to automate their shellcode and payload creation pipeline.
+
+# Contributing
+This is some cool shit, get real. If you want to contribute new ideas, fix your own bugs, submit Issues for me to fix, so on and so forth, go for it.
+
+# AI Disclaimer
+I am not against AI-generated code, so long as it is GOOD. If you submit AI generated PRs, I will scrutinize the shit out of it, and TRY to break it. If it passes, then I'll merge.

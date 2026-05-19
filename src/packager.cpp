@@ -317,7 +317,7 @@ namespace mkpivm {
 
             // ir-level obfuscation. use sub-rng so we dont fuck up
             // downstream
-            obfuscate_ir_dead_inject(prog, rng, /*density_pct=*/20);       // density_pct should be user-set, but i dont trust you ppl
+            obfuscate_ir_dead_inject(prog, rng, /*density_pct=*/20);
             obfuscate_ir_opaque_predicates(prog, rng, /*density_pct=*/25);
         }
 
@@ -329,6 +329,34 @@ namespace mkpivm {
         if (opt.pack_mode) {
             vm.set_pack_mode(true);
         }
+        if (opt.range_leak_nvs) {
+            vm.set_range_leak_nvs(true);
+        }
+
+        // headroom scan
+        {
+            std::int32_t max_pos_disp = 0;
+            for (const auto& blk : prog.blocks) {
+                for (const auto& insn : blk.insns) {
+                    for (const auto& op : insn.ops) {
+                        if (!std::holds_alternative<Mem>(op)) continue;
+                        const auto& m = std::get<Mem>(op);
+                        if (m.disp <= 0) continue;
+                        if (m.base == XReg::SP || m.base == XReg::BP) {
+                            if (m.disp > max_pos_disp) max_pos_disp = m.disp;
+                        }
+                    }
+                }
+            }
+            if (max_pos_disp > 0) {
+                vm.set_vm_sp_headroom(static_cast<std::uint32_t>(max_pos_disp) + 64u);
+            }
+            if (opt.verbose) {
+                std::fprintf(stderr, "headroom scan: max_pos_disp=0x%x set headroom=0x%x\n",
+                    max_pos_disp, vm.vm_sp_headroom());
+            }
+        }
+
         CodecRegistry codecs{vm, rng};
 
         if (opt.verbose) {
@@ -422,13 +450,33 @@ namespace mkpivm {
                 std::uint32_t bid;
 
                 try {
-                    bid = prog.block_id_for(entry_va); 
+                    bid = prog.block_id_for(entry_va);
                 }
                 catch (...) {
                     throw Error(fmt::format("ranges 0x{:x}: no ir block at this va, probably not on an insn boundary", s));
                 }
 
                 range_bc_offsets.push_back(block_id_to_bc_off.at(bid));
+            }
+
+            // rip-via-call. each unique ret_va that the shellcode treats as
+            // a self-pointer needs its own entry stub so the eventual native
+            // `call reg` doesnt fly into the int3 fill. dormant for now,
+            // lifter side of the pattern detect isnt wired up yet, see
+            // feedback_cobalt_stager_range_limit mental note
+            std::vector<std::pair<std::uint32_t /*va_off*/, std::uint32_t /*stub_idx*/>> rip_via_call_stubs;
+            {
+                std::unordered_set<std::uint64_t> seen;
+                for (const auto va : prog.rip_via_call_targets) {
+                    if (!seen.insert(va).second) continue;
+                    if (va < opt.base_va || va >= opt.base_va + shellcode.size) continue;
+                    std::uint32_t bid;
+                    try { bid = prog.block_id_for(va); }
+                    catch (...) { continue; }
+                    const std::uint32_t stub_idx = static_cast<std::uint32_t>(range_bc_offsets.size());
+                    range_bc_offsets.push_back(block_id_to_bc_off.at(bid));
+                    rip_via_call_stubs.emplace_back(static_cast<std::uint32_t>(va - opt.base_va), stub_idx);
+                }
             }
 
             // collect unique CALL_VM/CALL_NATIVE return-VAs that need a
@@ -582,6 +630,9 @@ namespace mkpivm {
                         case FixupKind::DataIslandInitFlag:
                             target = static_cast<std::int64_t>(gen.offsets().data_island_init_flag);
                             break;
+                        case FixupKind::RuntimeNonce:
+                            target = static_cast<std::int64_t>(gen.offsets().runtime_nonce_slot);
+                            break;
                         case FixupKind::TrampolineOffset:
                             throw Error("ranges: trampoline fixup leaked into stub, that's a bug. great.");
                         default:
@@ -621,7 +672,7 @@ namespace mkpivm {
                 const std::size_t stub_base = blob.size();
                 blob.insert(blob.end(), bytes.begin(), bytes.end());
 
-                // patch each range start with jmp rel32 to vm_entry_K 
+                // patch each range start with jmp rel32 to vm_entry_K
                 const auto& range_entries = gen.offsets().range_entries;
                 for (std::size_t k = 0; k < opt.ranges.size(); ++k) {
                     const std::uint32_t start        = opt.ranges[k].first;
@@ -636,8 +687,21 @@ namespace mkpivm {
 
                     for (int i = 0; i < 4; ++i) blob[start + 1 + i] = static_cast<std::uint8_t>(r >> (8 * i));
 
-                    // fill the rest of the range with int3 
+                    // fill the rest of the range with int3
                     for (std::uint32_t p = patch_end; p < end; ++p) blob[p] = 0xCC;
+                }
+
+                // splat a jmp rel32 over the int3 fill at each rip-via-call
+                // ret_va so native `call reg` lands on the mid-range stub
+                for (const auto& [va_off, stub_idx] : rip_via_call_stubs) {
+                    if (va_off + 5 > shellcode.size) continue; // not enough room
+                    const std::uint32_t patch_end    = va_off + 5;
+                    const std::uint64_t vm_entry_abs = stub_base + range_entries[stub_idx];
+                    const std::int64_t  rel          = static_cast<std::int64_t>(vm_entry_abs) - static_cast<std::int64_t>(patch_end);
+                    if (rel < INT32_MIN || rel > INT32_MAX) throw Error("ranges: rip-via-call jmp rel32 out of range");
+                    blob[va_off] = 0xE9;
+                    const std::uint32_t r = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel));
+                    for (int i = 0; i < 4; ++i) blob[va_off + 1 + i] = static_cast<std::uint8_t>(r >> (8 * i));
                 }
 
                 if (opt.verbose) {
@@ -978,6 +1042,9 @@ namespace mkpivm {
                         break;
                     case FixupKind::DataIslandInitFlag:
                         target = static_cast<std::int64_t>(gen.offsets().data_island_init_flag);
+                        break;
+                    case FixupKind::RuntimeNonce:
+                        target = static_cast<std::int64_t>(gen.offsets().runtime_nonce_slot);
                         break;
                     case FixupKind::Handler: {
                         const std::uint8_t b = static_cast<std::uint8_t>(fx.target_data);

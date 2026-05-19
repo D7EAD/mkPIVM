@@ -230,6 +230,13 @@ namespace mkpivm {
         // VA ... block id, built by CFG construction
         std::vector<std::pair<std::uint64_t, std::uint32_t>> va_to_block;
 
+        // VAs of `call X; X: pop reg` ret-addrs. cobalt-style shellcodes
+        // pull this rip-via-call stunt to fish their own runtime addr out
+        // of the stack and reuse it as a function pointer. packager has
+        // to drop an entry stub at each ret_va so a later `call reg`
+        // doesnt fly into the int3 fill.
+        std::vector<std::uint64_t> rip_via_call_targets;
+
         std::uint32_t block_id_for(std::uint64_t va) const;
 
         // offset of va inside its data chunk if it's in one

@@ -56,12 +56,25 @@ namespace mkpivm {
         off_.data_island_init_flag = e.size();
         e.u8(vm_.pack_mode() ? 0 : 1);
 
+        // blob mirror of the runtime nonce. range mode gives every entry a
+        // fresh stack-allocated VMState, so the old VMState-only slot was
+        // straight garbage on entry 2 and dispatch XORed handler addrs with
+        // it like a moron. we keep the real value here and copy in every
+        // state_init.
+        off_.runtime_nonce_slot = e.size();
+        for (int i = 0; i < 8; ++i) e.u8(0);
+
         emit_all_handlers(e);
         emit_exit_handler(e);
     }
 
     // keyed by emitter pointer
     static std::unordered_map<const X64Emitter*, PrologueOrder> g_prologue_orders;
+
+    const std::vector<std::uint8_t>* prologue_order_for(const X64Emitter& e) {
+        auto it = g_prologue_orders.find(&e);
+        return it == g_prologue_orders.end() ? nullptr : &it->second.order;
+    }
 
     void VMCodeGen::emit_prologue(X64Emitter& e, std::size_t /*data_island_size*/) {
         PrologueOrder po;
@@ -170,9 +183,15 @@ namespace mkpivm {
             0
         );
 
-        // VM_RSP = state_ptr - 8, top of the shadow stack right below VMState.
-        e.mov_reg_reg(rx::rax, cfg.state_ptr);
-        e.sub_reg_imm32(rx::rax, 8);
+        // VM_RSP = state_ptr - 8 - headroom (16-aligned). headroom reserves
+        // room above VM_SP for lifted code that does mov rax, [rsp+disp] or
+        // [rbp+disp] with disp > 0
+        {
+            const std::uint32_t hr_raw = vm_.vm_sp_headroom();
+            const std::uint32_t hr = (hr_raw + 15u) & ~15u;
+            e.mov_reg_reg(rx::rax, cfg.state_ptr);
+            e.sub_reg_imm32(rx::rax, static_cast<std::int32_t>(8u + hr));
+        }
         e.mov_mem_reg(
             cfg.state_ptr,
             static_cast<std::int32_t>(st.regs_base + vm_.slot_of_xreg(XReg::SP) * 8),
@@ -405,6 +424,21 @@ namespace mkpivm {
                 rx::rax,
                 true
             );
+
+            // also dump it into the blob slot so entries 2..N can pick it up.
+            auto nonce_slot_lea = e.lea_reg_rip(cfg.scratch_b, 0);
+            e.add_fixup(
+                nonce_slot_lea,
+                static_cast<std::uint32_t>(FixupKind::RuntimeNonce),
+                0,
+                0
+            );
+            e.mov_mem_reg(
+                cfg.scratch_b,
+                0,
+                rx::rax,
+                true
+            );
         }
 
         // handler-table decrypt, always runs since the table is fixed 1024 bytes
@@ -524,6 +558,33 @@ namespace mkpivm {
             e.u8(1);
         }
         e.bind(lbl_skip_decrypts);
+
+        // copy blob nonce -> VMState slot every single entry, no exceptions.
+        // first entry already wrote it above, the copy is a no-op then. on
+        // entry 2+ in range mode this is the only spot where VMState gets a
+        // real value before dispatch starts XORing handler-table reads.
+        {
+            constexpr std::int32_t kRuntimeNonceOff2 = 80;
+            auto nonce_lea = e.lea_reg_rip(cfg.scratch_b, 0);
+            e.add_fixup(
+                nonce_lea,
+                static_cast<std::uint32_t>(FixupKind::RuntimeNonce),
+                0,
+                0
+            );
+            e.mov_reg_mem(
+                rx::rax,
+                cfg.scratch_b,
+                0,
+                true
+            );
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff2,
+                rx::rax,
+                true
+            );
+        }
 
         // reset cipher_state and ip for bytecode dispatch
         {
@@ -672,46 +733,13 @@ namespace mkpivm {
         }
 
         // state init proper, skip the regs[] zero loop because we already
-        // marshalled values into those slots
+        // marshalled values into the GPR slots
         emit_state_init(
             e,
             /*bytecode_size=*/0,
             data_island_size,
             block_table_count,
             /*skip_regs_zero=*/true
-        );
-
-        // push exit_handler_addr onto the VM shadow stack
-        auto exit_slot = e.lea_reg_rip(rx::rax, 0);
-        e.add_fixup(
-            exit_slot,
-            static_cast<std::uint32_t>(FixupKind::VMExit),
-            0,
-            0
-        );
-
-        const std::uint8_t sp_slot = vm_.slot_of_xreg(XReg::SP);
-        const std::int32_t sp_off  = static_cast<std::int32_t>(st.regs_base + sp_slot * 8);
-        e.mov_reg_mem(
-            rx::rcx,
-            cfg.state_ptr,
-            sp_off,
-            true
-        );
-
-        e.sub_reg_imm32(rx::rcx, 8);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            sp_off,
-            rx::rcx,
-            true
-        );
-
-        e.mov_mem_reg(
-            rx::rcx,
-            0,
-            rx::rax,
-            true
         );
 
         if (bytecode_offset != 0) {

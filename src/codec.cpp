@@ -1,4 +1,5 @@
 #include "mkpivm/codec.h"
+#include "mkpivm/vm_codegen.h"
 
 #include <algorithm>
 
@@ -302,18 +303,18 @@ namespace mkpivm {
 
         auto label_of = [&](int w) {
             switch (w) { 
-                case 1: return lbl_w1;
-                case 2: return lbl_w2;
-                case 4: return lbl_w4;
+                case 1:  return lbl_w1;
+                case 2:  return lbl_w2;
+                case 4:  return lbl_w4;
                 default: return lbl_w8;
             }
         };
 
         auto emit_body = [&](int w) {
             switch (w) {
-                case 1: e.and_reg_imm32(reg, 0xFF);    break;
-                case 2: e.and_reg_imm32(reg, 0xFFFF);  break;
-                case 4: e.mov_reg_reg(reg, reg, false); break;
+                case 1: e.and_reg_imm32(reg, 0xFF);       break;
+                case 2: e.and_reg_imm32(reg, 0xFFFF);     break;
+                case 4: e.mov_reg_reg(reg, reg, false);   break;
                 case 8: /* full 64-bit, no mask needed */ break;
             }
         };
@@ -942,11 +943,10 @@ namespace mkpivm {
         shuffle_in_place(pool, local_rng);
 
         const std::uint8_t B = pool[0]; // base slot idx, base val, fetched value
-        const std::uint8_t I = pool[1]; // index slot idx, index val
-        const std::uint8_t S = pool[2]; // scale, dead after fetch
+        const std::uint8_t I = pool[1]; // index slot idx, index val with scale shift
+        const std::uint8_t S = pool[2]; // scale_log2, dead after scale dispatch
         const std::uint8_t W = pool[3]; // mem_width
         const std::uint8_t A = pool[4]; // address accumulator
-        (void)S;
 
         // base, index, scale, seg, disp32, mem_width
         emit_fetch_byte_dec(e, vm, B);
@@ -986,6 +986,50 @@ namespace mkpivm {
             static_cast<std::int32_t>(vm.state_layout().regs_base), 
             true
         );
+
+        // scale dispatch, was missing this impl like a fucking retard
+        {
+            SeedRng prng(vm.cipher_k1() ^ 0x570BE5CA1EULL);
+            std::array<int, 4> sc{0, 1, 2, 3};
+            shuffle_in_place(sc, prng);
+            std::array<int, 3> body_order{sc[0], sc[1], sc[2]};
+            shuffle_in_place(body_order, prng);
+
+            auto lbl_s0 = e.new_label(), lbl_s1 = e.new_label();
+            auto lbl_s2 = e.new_label(), lbl_s3 = e.new_label();
+            auto lbl_send = e.new_label();
+
+            auto label_of = [&](int v) {
+                switch (v) {
+                    case 0:  return lbl_s0;
+                    case 1:  return lbl_s1;
+                    case 2:  return lbl_s2;
+                    default: return lbl_s3;
+                }
+            };
+
+            auto emit_body = [&](int v) {
+                if (v != 0) e.shl_reg_imm8(I, static_cast<std::uint8_t>(v));
+            };
+
+            for (int v : {sc[0], sc[1], sc[2]}) {
+                e.cmp_reg_imm32(S, v);
+                e.jcc_label(cc::z, label_of(v));
+            }
+
+            emit_body(sc[3]);
+            e.jmp_label(lbl_send);
+
+            for (std::size_t i = 0; i < body_order.size(); ++i) {
+                const int v = body_order[i];
+                e.bind(label_of(v));
+                emit_body(v);
+                if (i + 1 != body_order.size()) e.jmp_label(lbl_send);
+            }
+
+            e.bind(lbl_send);
+        }
+
         e.bind(lbl_ni);
         e.add_reg_reg(A, I);
         e.movsxd_r64_r32(B, r.scratch_a);
@@ -2058,7 +2102,7 @@ namespace mkpivm {
 
         // seed-permute the 6 temp-register roles across the Win64 volatile pool
         // rax/rcx/rdx/r8/r9/r10/r11
-        std::array<std::uint8_t, 7> pool{rx::rax, rx::rcx, rx::rdx, rx::r8, rx::r9, rx::r10, rx::r11};
+        std::array<std::uint8_t, 6> pool{rx::rax, rx::rcx, rx::rdx, rx::r8, rx::r9, rx::r10};
 
         SeedRng local_rng(vm.cipher_k1());
         shuffle_in_place(pool, local_rng);
@@ -2810,6 +2854,50 @@ namespace mkpivm {
                 rx::rax,
                 true
             ); // [caller_retaddr] = target
+
+            // --range-leak-nvs. blast current VMState NV slots over the
+            // prologue stack saves so exit_handler's pop sequence picks up
+            // what the lifted range actually wrote instead of the stale
+            // caller-side values. off by default because function-shaped
+            // ranges hit this path on mid-flow escapes and trashing the
+            // caller's nvs would just be a dick move. flip it on for
+            // straight-line partial lifts where downstream native bytes
+            // need to see what the lifted code wrote. rcx still points at
+            // caller_retaddr. NV[i] = po.order[i] sits at saved_rsp +
+            // aligned + 64 - 8*i, which off rcx is rcx - 8*(i+1).
+            if (vm.range_leak_nvs()) {
+                if (const auto* order = prologue_order_for(e)) {
+                    auto host_to_xreg = [](std::uint8_t reg) -> XReg {
+                        if (reg == rx::rbx) return XReg::BX;
+                        if (reg == rx::rbp) return XReg::BP;
+                        if (reg == rx::rdi) return XReg::DI;
+                        if (reg == rx::rsi) return XReg::SI;
+                        if (reg == rx::r12) return XReg::R12;
+                        if (reg == rx::r13) return XReg::R13;
+                        if (reg == rx::r14) return XReg::R14;
+                        if (reg == rx::r15) return XReg::R15;
+                        return XReg::Invalid;
+                    };
+                    for (std::size_t i = 0; i < order->size(); ++i) {
+                        const std::uint8_t nv_reg = (*order)[i];
+                        const XReg xr = host_to_xreg(nv_reg);
+                        if (xr == XReg::Invalid) continue;
+                        e.mov_reg_mem(
+                            rx::rax,
+                            sp,
+                            static_cast<std::int32_t>(vm.state_layout().regs_base + vm.slot_of_xreg(xr) * 8),
+                            true
+                        );
+                        e.mov_mem_reg(
+                            rx::rcx,
+                            -static_cast<std::int32_t>(8 * (i + 1)),
+                            rx::rax,
+                            true
+                        );
+                    }
+                }
+            }
+
             e.mov_reg_mem(
                 rx::rcx,
                 sp,

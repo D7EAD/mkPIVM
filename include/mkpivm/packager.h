@@ -26,6 +26,15 @@ namespace mkpivm {
         // data island encrypted, emit a one-insn IR program of JMP_NATIVE imm=0,
         // and let the wrapper VM decrypt and jump
         bool pack_mode{false};
+
+        // --range-leak-nvs. JMP_NATIVE imm-cleanup overwrites the prologue
+        // NV saves with the current VMState slots so lifted ebx/ebp/esi/edi
+        // and r12..r15 writes make it back to the surrounding native bytes.
+        // off by default cuz function-shaped ranges have mid-flow escapes
+        // that have no business trashing the caller's nvs. flip it on for
+        // straight-line partial lifts where downstream native bytes need
+        // to see what the lifted code wrote.
+        bool range_leak_nvs{false};
     };
 
     struct PackageResult {
