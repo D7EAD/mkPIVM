@@ -436,10 +436,10 @@ cmake --build build --config Release --target mkpivm
 # Plans
 * Release more badass PIVM-based offensive security tooling (just you wait).
 * Place more granular control over PIVM internals in the hands of operators and developers from the CLI.
-* Provide a C++ library interface into PIVM for developers to automate their shellcode and payload creation pipelime.
+* Provide a C++ library interface into PIVM for developers to automate their shellcode and payload creation pipeline.
 
 # Contributing
 This is some cool shit, get real. If you want to contribute new ideas, fix your own bugs, submit Issues for me to fix, so on and so forth, go for it.
 
 # AI Disclaimer
-I am not against AI-generated code, so long as it is GOOD. If you submit AI generated PRs, I will scrutinize the shit out of it, and TRY to break it. If it passes, then I'll merge. 
+I am not against AI-generated code, so long as it is GOOD. If you submit AI generated PRs, I will scrutinize the shit out of it, and TRY to break it. If it passes, then I'll merge.
