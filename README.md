@@ -1,4 +1,4 @@
-> my repo is getting swarmed with bots. you're a fucking dickhead.
+> my repo is getting swarmed with bots. you're a dickhead.
 
 <p align="center">
   <img src="./images/mkpivm.png" width="30%" height="30%">
