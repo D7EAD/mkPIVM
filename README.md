@@ -431,7 +431,7 @@ cmake --build build --config Release --target mkpivm
 * This project is largely proof-of-concept research. If it is well-received, I will extend it as requested and welcome contribution. However, it seemed stable for the tested samples.
 * If your shellcode doesn't work, and you don't want to place it in an Issue, then unfortunately I can't help you. This was tested on Sliver, Cobalt Strike 4.12, MSF, Havoc, and a few other undisclosed samples.
 * In my testing, injection of the VM into live processes worked fine. However, when it comes to embedding into PEs, this was not tested with commercial software like MS Word, only synthetic tests, but it probably works. If not, will fix.
-* As of 5/20/2026, it appears the repo is being swarmed with bots. So, that's wonderful. Please ignore all blank Github accounts.
+* As of 5/20/2026 (seems to have ended now), it appears the repo is being swarmed with bots. So, that's wonderful. Please ignore all blank Github accounts.
 
 # Contributing
 This is some cool shit, get real. If you want to contribute new ideas, fix your own bugs, submit Issues for me to fix, so on and so forth, go for it.
