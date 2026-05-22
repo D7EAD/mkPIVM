@@ -6,7 +6,7 @@
   <a href="./research/mkpivm-research.pdf">Read</a> the research paper.
 </p>
 
-**mkPIVM** is a polymorphic position-independent shellcode virtualizer for Windows x86 and x64.
+**mkPIVM** is a polymorphic position-independent shellcode virtualizer for Windows x86 and x64 (Linux soon).
 
 Feed it raw shellcode. It emits another raw blob: a small virtual machine that interprets a lifted, encrypted-at-rest version of your original instructions. The output is itself position-independent code and runs anywhere the original shellcode would, from a remote-thread loader to a code cave detour. Every per-seed knob varies independently: cipher family, register slot layout, opcode-to-handler permutation, dispatcher topology, junk-gadget pattern, IR obfuscation insertion points. Two builds from the same input share fewer than a hundred coincidental bytes out of tens of kilobytes.
 
