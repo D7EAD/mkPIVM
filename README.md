@@ -1,4 +1,4 @@
-> v1.1.0 coming tonight, range/coroutines fixed. other bug fixes. optional architecture change via flag.
+> v1.1.0 coming tonight (maybe...), range/coroutines fixed. other bug fixes. optional architecture change via flag.
 
 <p align="center">
   <img src="./images/mkpivm.png" width="30%" height="30%">
