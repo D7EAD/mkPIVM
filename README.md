@@ -1,5 +1,3 @@
-> looking like v1.1.0 is coming tonight
-
 <p align="center">
   <img src="./images/mkpivm.png" width="30%" height="30%">
   <br>
