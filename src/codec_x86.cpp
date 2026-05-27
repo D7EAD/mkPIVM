@@ -11,13 +11,13 @@ namespace mkpivm {
         constexpr std::int32_t kSavedCsOff      = 32;
         constexpr std::int32_t kSavedTargetOff  = 40;
         constexpr std::int32_t kCipherInitOff   = 48;
+        constexpr std::int32_t kSavedTagOff     = 72;
         constexpr std::int32_t kPreDecryptIpOff = 88;
         constexpr std::int32_t kPreDecryptCsOff = 96;
         constexpr std::int32_t kSboxInvOff      = 256;
 
-        // local copy of vm_codegen_x86.cpp's x86_self_locate 
-        static void x86_self_locate(X86Emitter& e, std::uint8_t dst,
-                                    FixupKind kind, std::uint64_t data = 0) {
+        // local copy of vm_codegen_x86.cpp's x86_self_locate
+        static void x86_self_locate(X86Emitter& e, std::uint8_t dst, FixupKind kind, std::uint64_t data = 0) {
             e.call_rel32(0);
             e.pop_reg(dst);
             e.u8(0x81);
@@ -30,6 +30,34 @@ namespace mkpivm {
                 data,
                 /*addend=*/7
             );
+        }
+
+        // load all 4 x86 NV regs from their lifted XReg slots.
+        static void x86_materialize_nvs(X86Emitter& e, const VMConfig& vm) {
+            const auto& r = vm.dispatcher_regs();
+            const auto regs_base = static_cast<std::int32_t>(vm.state_layout().regs_base);
+            const std::uint8_t sp_host = r.state_ptr;
+
+            const auto load_nv = [&](std::uint8_t host_reg, XReg xr) {
+                e.mov_reg_mem(
+                    host_reg,
+                    r.state_ptr,
+                    regs_base + static_cast<std::int32_t>(vm.slot_of_xreg(xr) * 8),
+                    true
+                );
+            };
+
+            if (sp_host != rx::rbx) load_nv(rx::rbx, XReg::BX);
+            if (sp_host != rx::rbp) load_nv(rx::rbp, XReg::BP);
+            if (sp_host != rx::rsi) load_nv(rx::rsi, XReg::SI);
+            if (sp_host != rx::rdi) load_nv(rx::rdi, XReg::DI);
+
+            const XReg sp_xr = (sp_host == rx::rbx) ? XReg::BX
+                             : (sp_host == rx::rbp) ? XReg::BP
+                             : (sp_host == rx::rsi) ? XReg::SI
+                             : (sp_host == rx::rdi) ? XReg::DI
+                             : XReg::Invalid;
+            if (sp_xr != XReg::Invalid) load_nv(sp_host, sp_xr);
         }
     }
 
@@ -350,7 +378,6 @@ namespace mkpivm {
             e.u8(0xE9);                                                                 \
             e.emit_rel32_fixup(static_cast<std::uint32_t>(FixupKind::VMExit), 0, 0);    \
         }
-
     #undef X86_STUB
 
     // NOP
@@ -1864,12 +1891,12 @@ namespace mkpivm {
         emit_dispatch_tail(e, vm);
     }
 
-    // CALL_NATIVE: invoke a Win32 API 
+    // CALL_NATIVE: invoke a Win32 API
     static void emit_native_handler_x86(X86Emitter& e, const VMConfig& vm, bool is_jmp) {
         const auto& r = vm.dispatcher_regs();
         const auto& st = vm.state_layout();
         {
-            // deferred data-island decrypt 
+            // deferred data-island decrypt
             auto lbl_done = e.new_label();
             x86_self_locate(e, r.scratch_a, FixupKind::DataIslandInitFlag);
             e.u8(0x80);
@@ -1907,8 +1934,7 @@ namespace mkpivm {
 
             // counter. third_volatile is free here because fetch_byte_dec only
             // touches scratch_a + cipher_state, and the deferred decrypt block
-            // runs before valreg-using handler body. rbx now holds cipher_state
-            // for x86, so we can't use it as the counter
+            // runs before valreg-using handler body
             const std::uint8_t counter_reg = third_volatile(r);
             e.mov_reg_imm32(counter_reg, static_cast<std::int32_t>(vm.data_island_size()), true);
 
@@ -1963,10 +1989,13 @@ namespace mkpivm {
         const std::int32_t saved_eax_off = static_cast<std::int32_t>(st.cipher_extra) + kSavedTargetOff;
 
         // skip cipher_extra+48 since the prologue stores cipher_init_state there.
-        const std::int32_t saved_ret_off = saved_eax_off + 16;
+        const std::int32_t saved_ret_off  = saved_eax_off + 16;
+        constexpr std::int32_t kRangeRetSignOff_x86 = 64;
+        const std::int32_t range_sign_off = static_cast<std::int32_t>(st.cipher_extra) + kRangeRetSignOff_x86;
 
         // fetch trampoline_offset, compute trampoline addr in valreg, save it.
         emit_fetch_u32_dec(e, vm, valreg);
+        e.mov_mem_reg(r.state_ptr, range_sign_off, valreg, true);
         e.mov_reg_mem(
             r.scratch_a,
             r.state_ptr,
@@ -1983,6 +2012,15 @@ namespace mkpivm {
 
         // fetch tag + compute target into valreg.
         emit_fetch_byte_dec(e, vm, r.scratch_a);
+
+        // stash tag for the jmp_native teardown below
+        e.mov_mem_reg(
+            r.state_ptr,
+            static_cast<std::int32_t>(st.cipher_extra) + kSavedTagOff,
+            r.scratch_a,
+            true
+        );
+
         auto lbl_vreg = e.new_label();
         auto lbl_mem  = e.new_label();
         auto lbl_have = e.new_label();
@@ -2050,7 +2088,8 @@ namespace mkpivm {
 
         // CALL_NATIVE: push trampoline_addr onto VM_ESP so the api's ret
         // pops it, landing in our trampoline rather than a data island
-        // address 
+        // address
+        const bool range_mode_call_x86 = vm.range_mode() && !vm.pack_mode() && !is_jmp;
         if (!is_jmp) {
             e.mov_reg_mem(
                 r.scratch_a,
@@ -2109,9 +2148,21 @@ namespace mkpivm {
             true
         );
 
-        // range-mode mid-exec JMP_NATIVE teardown for x86 
+        // range-mode mid-exec JMP_NATIVE teardown for x86. branch on the
+        // tag we stashed at kSavedTagOff above
         if (vm.range_mode() && !vm.pack_mode() && is_jmp) {
-            const std::uint32_t frame_size = static_cast<std::uint32_t>(vm.state_layout().total_size) + vm.shadow_stack_bytes() + 256;
+            auto lbl_api_path = e.new_label();
+            e.mov_reg_mem(
+                r.scratch_a,
+                r.state_ptr,
+                static_cast<std::int32_t>(st.cipher_extra) + kSavedTagOff,
+                true
+            );
+            e.test_reg_reg(r.scratch_a, r.scratch_a, true);
+            e.jcc_label(cc::nz, lbl_api_path);
+
+            // tag == 0: imm passthrough -> exit_handler.
+            const std::uint32_t frame_size = static_cast<std::uint32_t>(vm.state_layout().total_size) + vm.shadow_stack_bytes() + vm.frame_padding();
             const std::uint32_t aligned_frame = (frame_size + 15) & ~15u;
 
             // scratch_a = saved_native_rsp value + aligned_frame + 20.
@@ -2131,7 +2182,8 @@ namespace mkpivm {
                 true
             );
 
-            // [scratch_a] = target.
+            // [scratch_a] = target. rewrites caller's retaddr so exit_handler's
+            // closing `ret` lands at the lifter-synthesized fall-through.
             e.mov_mem_reg(
                 r.scratch_a,
                 0,
@@ -2139,7 +2191,9 @@ namespace mkpivm {
                 true
             );
 
-            // --range-leak-nvs, opt-in. see the x64 sibling, same dumb story.
+            // --range-leak-nvs, opt-in. blast lifted NV slot values over
+            // the prologue saves so exit_handler's pops pick them up.
+            // same dumb story as the x64 sibling.
             if (vm.range_leak_nvs()) if (const auto* order = prologue_order_for(e)) {
                 auto host_to_xreg = [](std::uint8_t reg) -> XReg {
                     if (reg == rx::rbx) return XReg::BX;
@@ -2152,10 +2206,9 @@ namespace mkpivm {
                     const std::uint8_t nv_reg = (*order)[i];
                     const XReg xr = host_to_xreg(nv_reg);
                     if (xr == XReg::Invalid) continue;
-                    // scratch_a points at the caller_retaddr stack slot
-                    // (aligned_frame + 20 above saved_native_rsp). NV[i]
-                    // (= po.order[i]) sits at saved_rsp + aligned + 4*(4-i),
-                    // i.e. scratch_a - 4*(i+1).
+
+                    // scratch_a points at caller_retaddr. NV index i sits
+                    // 4 bytes per slot below, so scratch_a minus 4 times i plus 4.
                     e.mov_reg_mem(
                         r.scratch_b,
                         r.state_ptr,
@@ -2171,13 +2224,13 @@ namespace mkpivm {
                 }
             }
 
-            // eax = VM_AX for the native return-value convention.
-            e.mov_reg_mem(
-                rx::rax,
-                r.state_ptr,
-                ax_off,
-                true
-            );
+            // materialize volatile regs from their VM slots
+            // so native code after range exit sees the lifted values
+            const std::int32_t cx_off = regs_base + static_cast<std::int32_t>(vm.slot_of_xreg(XReg::CX) * 8);
+            const std::int32_t dx_off = regs_base + static_cast<std::int32_t>(vm.slot_of_xreg(XReg::DX) * 8);
+            e.mov_reg_mem(rx::rcx, r.state_ptr, cx_off, true);
+            e.mov_reg_mem(rx::rdx, r.state_ptr, dx_off, true);
+            e.mov_reg_mem(rx::rax, r.state_ptr, ax_off, true);
 
             // jmp rel32 to exit_handler.
             e.u8(0xE9);
@@ -2189,7 +2242,100 @@ namespace mkpivm {
                 0,
                 0
             );
+
+            // tag != 0: api_path. bypass exit_handler entirely so NVs come from
+            // their lifted XReg slots
+            e.bind(lbl_api_path);
+
+            if (vm.heap_stack()) {
+                // heap stack
+                const std::uint32_t frame_size_h = static_cast<std::uint32_t>(vm.state_layout().total_size) + vm.shadow_stack_bytes() + vm.frame_padding();
+                const std::uint32_t aligned_h = (frame_size_h + 15) & ~15u;
+                const std::int32_t native_esp_delta_h = static_cast<std::int32_t>(aligned_h) + 20 - static_cast<std::int32_t>(vm.shadow_stack_bytes());
+                const std::uint32_t hr_raw = vm.vm_sp_headroom();
+                const std::uint32_t hr = (hr_raw + 15u) & ~15u;
+                const std::int32_t real_esp_bias = native_esp_delta_h + 8 + static_cast<std::int32_t>(hr) + static_cast<std::int32_t>(vm.coro_prelo() * 4);
+
+                // scratch_a = VM_RSP_slot value
+                e.mov_reg_mem(r.scratch_a, r.state_ptr, sp_off, true);
+
+                // valreg = retaddr at [VM_RSP_slot].
+                e.mov_reg_mem(valreg, r.scratch_a, 0, true);
+
+                // scratch_a = real_esp.
+                e.add_reg_imm32(r.scratch_a, real_esp_bias, true);
+
+                // [real_esp] = retaddr.
+                e.mov_mem_reg(r.scratch_a, 0, valreg, true);
+
+                // rsp = real_esp.
+                e.mov_reg_reg(rx::rsp, r.scratch_a, true);
+
+                // scratch_b = target, reusing the retaddr reg.
+                e.mov_reg_mem(r.scratch_b, r.state_ptr, saved_eax_off, true);
+
+                // volatiles from slots, skip scratch_b which holds target.
+                if (rx::rax != r.scratch_b) e.mov_reg_mem(rx::rax, r.state_ptr, ax_off, true);
+                if (rx::rcx != r.scratch_b) e.mov_reg_mem(rx::rcx, r.state_ptr, regs_base + static_cast<std::int32_t>(vm.slot_of_xreg(XReg::CX) * 8), true);
+                if (rx::rdx != r.scratch_b) e.mov_reg_mem(rx::rdx, r.state_ptr, regs_base + static_cast<std::int32_t>(vm.slot_of_xreg(XReg::DX) * 8), true);
+
+                // NVs from slots, state_ptr-host-reg gets clobbered last.
+                x86_materialize_nvs(e, vm);
+                e.jmp_reg(r.scratch_b);
+                return;
+            }
+
+            // shadow-stack default. rsp = VM_RSP, materialize NVs+volatiles, jmp.
+            e.mov_reg_mem(r.scratch_b, r.state_ptr, saved_eax_off, true);
+
+            // volatiles from slots, skip scratch_b which holds target.
+            if (rx::rax != r.scratch_b) e.mov_reg_mem(rx::rax, r.state_ptr, ax_off, true);
+            if (rx::rcx != r.scratch_b) e.mov_reg_mem(rx::rcx, r.state_ptr, regs_base + static_cast<std::int32_t>(vm.slot_of_xreg(XReg::CX) * 8), true);
+            if (rx::rdx != r.scratch_b) e.mov_reg_mem(rx::rdx, r.state_ptr, regs_base + static_cast<std::int32_t>(vm.slot_of_xreg(XReg::DX) * 8), true);
+
+            e.mov_reg_mem(rx::rsp, r.state_ptr, sp_off, true);
+
+            // NVs from slots, state_ptr-host-reg gets clobbered last.
+            x86_materialize_nvs(e, vm);
+            e.jmp_reg(r.scratch_b);
             return;
+        }
+
+        // range-mode CALL_NATIVE
+        if (range_mode_call_x86) {
+            auto lbl_in_range_x86 = e.new_label();
+            e.mov_reg_mem(r.scratch_a, r.state_ptr, range_sign_off, true);
+            e.test_reg_reg(r.scratch_a, r.scratch_a, true);
+            e.jcc_label(cc::ns, lbl_in_range_x86);
+
+            // out-of-range real-stack dispatch.
+            const std::uint32_t frame_size_oc = static_cast<std::uint32_t>(vm.state_layout().total_size) + vm.shadow_stack_bytes() + vm.frame_padding();
+            const std::uint32_t aligned_frame_oc = (frame_size_oc + 15) & ~15u;
+
+            // x86 prologue pushes 4 NV + pushfd = 20B before sub
+            // esp aligned_frame; lea state_ptr, [esp + shadow]. so
+            // native_entry_esp = state_ptr + (aligned_frame + 20 - shadow).
+            const std::int32_t native_esp_delta = static_cast<std::int32_t>(aligned_frame_oc) + 20 - static_cast<std::int32_t>(vm.shadow_stack_bytes());
+
+            // esp = native_entry_esp - 4
+            e.lea_reg_mem(rx::rsp, r.state_ptr, rx::none, 0, native_esp_delta - 4);
+
+            // scratch_a = saved_ret_va_ptr
+            e.mov_reg_mem(r.scratch_a, r.state_ptr, saved_ret_off, true);
+            e.mov_mem_reg(rx::rsp, 0, r.scratch_a, true);
+
+            // scratch_b = target = API addr or whatever.
+            e.mov_reg_mem(r.scratch_b, r.state_ptr, saved_eax_off, true);
+
+            // load eax = VM_AX
+            e.mov_reg_mem(rx::rax, r.state_ptr, ax_off, true);
+
+            // scratch_b lives in a volatile reg; the materialize loop only
+            // touches NV regs, so scratch_b survives across it.
+            x86_materialize_nvs(e, vm);
+            e.jmp_reg(r.scratch_b);
+
+            e.bind(lbl_in_range_x86);
         }
 
         // switch esp to VM_RSP. args were already pushed by shellcode PUSHes.
@@ -2201,7 +2347,7 @@ namespace mkpivm {
         );
 
         // load host eax = VM_AX so the trampoline's VM_AX = eax writeback is
-        // a no-op when control reaches a trampoline directly 
+        // a no-op when control reaches a trampoline directly
         e.mov_reg_mem(
             rx::rax,
             r.state_ptr,

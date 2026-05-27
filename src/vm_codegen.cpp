@@ -95,7 +95,7 @@ namespace mkpivm {
         emit_junk(e, vm_, rng_);
 
         const auto& cfg = vm_.dispatcher_regs();
-        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + 256;
+        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + vm_.frame_padding();
         const std::uint32_t aligned = (frame_size + 15) & ~15u;
         e.sub_reg_imm32(rx::rsp, static_cast<std::int32_t>(aligned));
         e.lea_reg_mem(
@@ -183,7 +183,7 @@ namespace mkpivm {
             0
         );
 
-        // VM_RSP = state_ptr - 8 - headroom (16-aligned). headroom reserves
+        // VM_RSP = state_ptr - 8 - headroom. headroom reserves
         // room above VM_SP for lifted code that does mov rax, [rsp+disp] or
         // [rbp+disp] with disp > 0
         {
@@ -674,7 +674,7 @@ namespace mkpivm {
         emit_prologue(e, data_island_size);
 
         // frame size has to match what emit_prologue computed.
-        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + 256;
+        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + vm_.frame_padding();
         const std::uint32_t aligned_frame = (frame_size + 15) & ~15u;
 
         // host volatile GPRs into VM slots
@@ -741,6 +741,26 @@ namespace mkpivm {
             block_table_count,
             /*skip_regs_zero=*/true
         );
+
+        // --coro-prelo N: copy N qwords from real_stack[0..N*8] onto VM_RSP
+        if (vm_.coro_prelo() > 0) {
+            const std::uint32_t prelo_n = vm_.coro_prelo();
+            const std::int32_t native_rsp_delta = static_cast<std::int32_t>(aligned_frame) + 72 -
+                static_cast<std::int32_t>(vm_.shadow_stack_bytes());
+            const std::uint8_t rsp_slot = vm_.slot_of_xreg(XReg::SP);
+            const std::int32_t rsp_off  = static_cast<std::int32_t>(st.regs_base + rsp_slot * 8);
+
+            e.lea_reg_mem(rx::rcx, cfg.state_ptr, rx::none, 0, native_rsp_delta);
+            e.mov_reg_mem(rx::r8, cfg.state_ptr, rsp_off, true);
+
+            // push in reverse so real[0] lands at BOTTOM of VM_RSP
+            for (std::int32_t i = static_cast<std::int32_t>(prelo_n) - 1; i >= 0; --i) {
+                e.mov_reg_mem(rx::rax, rx::rcx, i * 8, true);
+                e.sub_reg_imm32(rx::r8, 8, /*w64=*/true);
+                e.mov_mem_reg(rx::r8, 0, rx::rax, true);
+            }
+            e.mov_mem_reg(cfg.state_ptr, rsp_off, rx::r8, true);
+        }
 
         if (bytecode_offset != 0) {
             e.add_reg_imm32(cfg.ip, static_cast<std::int32_t>(bytecode_offset));
@@ -862,7 +882,7 @@ namespace mkpivm {
             true
         );
 
-        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + 256;
+        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + vm_.frame_padding();
         const std::uint32_t aligned = (frame_size + 15) & ~15u;
         e.add_reg_imm32(rx::rsp, static_cast<std::int32_t>(aligned));
         e.popfq();

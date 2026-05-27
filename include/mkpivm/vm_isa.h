@@ -117,11 +117,30 @@ namespace mkpivm {
             bool pack_mode() const noexcept { return pack_mode_; }
             void set_pack_mode(bool on) noexcept { pack_mode_ = on; }
 
-            // --range-leak-nvs opt-in. tell JMP_NATIVE imm-cleanup to splat
-            // VMState NV slots back over the prologue stack saves so lifted
-            // ebx/ebp/esi/edi writes survive into the surrounding native.
+            // --range-leak-nvs opt-in 
             bool range_leak_nvs() const noexcept { return range_leak_nvs_; }
             void set_range_leak_nvs(bool on) noexcept { range_leak_nvs_ = on; }
+
+            // --coro-prelo 
+            std::uint32_t coro_prelo() const noexcept { return coro_prelo_; }
+            void set_coro_prelo(std::uint32_t n) noexcept { coro_prelo_ = n; }
+
+            // setter for shadow_stack_bytes so packager can override the
+            // seed-randomized default
+            void set_shadow_stack_bytes(std::uint32_t n) noexcept {
+                shadow_stack_bytes_ = (n + 0xFu) & ~0xFu;
+            }
+
+            // padding above state in the prologue allocation. baseline 256
+            // bytes 
+            std::uint32_t frame_padding() const noexcept {
+                // 4 KB in coro-prelo mode 
+                return coro_prelo_ > 0 ? 0x1000u : 256u;
+            }
+
+            // --heap-stack toggle
+            bool heap_stack() const noexcept { return heap_stack_; }
+            void set_heap_stack(bool on) noexcept { heap_stack_ = on; }
 
             // size of the data island in bytes
             std::uint32_t data_island_size() const noexcept { return data_island_size_; }
@@ -185,6 +204,8 @@ namespace mkpivm {
             bool                          range_mode_{false};
             bool                          pack_mode_{false};
             bool                          range_leak_nvs_{false};
+            std::uint32_t                 coro_prelo_{0};
+            bool                          heap_stack_{false};
             std::uint32_t                 data_island_size_{0};
             std::uint32_t                 vm_sp_headroom_{0};
 

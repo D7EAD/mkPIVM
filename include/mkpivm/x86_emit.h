@@ -46,12 +46,7 @@ namespace mkpivm {
             };
             std::size_t emit_rel32_fixup(std::uint32_t kind, std::uint64_t data, std::int64_t addend = 0);
 
-            void add_fixup(
-                std::size_t at,
-                std::uint32_t kind,
-                std::uint64_t data,
-                std::int64_t addend = 0
-            ) {
+            void add_fixup(std::size_t at, std::uint32_t kind, std::uint64_t data, std::int64_t addend = 0) {
                 fixups_.push_back({at, addend, kind, data});
             }
             const std::vector<Fixup>& fixups() const noexcept { return fixups_; }

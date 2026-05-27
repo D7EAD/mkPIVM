@@ -30,11 +30,17 @@ namespace mkpivm {
         // --range-leak-nvs. JMP_NATIVE imm-cleanup overwrites the prologue
         // NV saves with the current VMState slots so lifted ebx/ebp/esi/edi
         // and r12..r15 writes make it back to the surrounding native bytes.
-        // off by default cuz function-shaped ranges have mid-flow escapes
-        // that have no business trashing the caller's nvs. flip it on for
-        // straight-line partial lifts where downstream native bytes need
-        // to see what the lifted code wrote.
         bool range_leak_nvs{false};
+
+        // --coro-prelo N. for coroutine-style range entries where native code
+        // has pushed values onto the real stack BEFORE we enter the VM at a
+        // mid-helper offset.
+        std::uint32_t coro_prelo{0};
+
+        // --heap-stack. switch the VM dispatcher to a blob-embedded static
+        // stack region instead of running on top of the host's real
+        // stack.
+        bool heap_stack{false};
     };
 
     struct PackageResult {

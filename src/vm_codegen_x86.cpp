@@ -36,7 +36,7 @@ namespace mkpivm {
         g_x86_prologue_orders[&e] = std::move(po);
 
         const auto& cfg = vm_.dispatcher_regs();
-        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + 256;
+        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + vm_.frame_padding();
         const std::uint32_t aligned = (frame_size + 15) & ~15u;
         e.sub_reg_imm32(rx::rsp, static_cast<std::int32_t>(aligned));
         e.lea_reg_mem(
@@ -344,22 +344,26 @@ namespace mkpivm {
 
             // dump lo+hi dword into the blob slot so entry 2+ can recover
             // the nonce. per-entry VMState lives on stack and dies between
-            // entries, same retarded story as x64.
+            // entries, same retarded story as x64. order matters: self_locate
+            // FIRST since its `pop reg` clobbers the destination, and any
+            // prior `mov rax, [state_ptr+...]` load would be lost if
+            // scratch_b == rax for this seed. then carry the value via
+            // scratch_a
+            x86_self_locate(e, cfg.scratch_b, FixupKind::RuntimeNonce);
             e.mov_reg_mem(
-                rx::rax,
+                cfg.scratch_a,
                 cfg.state_ptr,
                 static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86,
                 true
             );
-            x86_self_locate(e, cfg.scratch_b, FixupKind::RuntimeNonce);
-            e.mov_mem_reg(cfg.scratch_b, 0, rx::rax, true);
+            e.mov_mem_reg(cfg.scratch_b, 0, cfg.scratch_a, true);
             e.mov_reg_mem(
-                rx::rax,
+                cfg.scratch_a,
                 cfg.state_ptr,
                 static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86 + 4,
                 true
             );
-            e.mov_mem_reg(cfg.scratch_b, 4, rx::rax, true);
+            e.mov_mem_reg(cfg.scratch_b, 4, cfg.scratch_a, true);
         }
 
         emit_decrypt_loop_x86(FixupKind::HandlerTable, 256 * 4);
@@ -410,21 +414,23 @@ namespace mkpivm {
 
         // copy blob nonce into VMState slot, every entry, no exceptions.
         // same shit as x64. without this entry 2 reads stack garbage and
-        // dispatch lookups go straight into the weeds.
+        // dispatch lookups go straight into the weeds. carry the loaded
+        // values via scratch_a so the load `mov reg, [scratch_b+...]`
+        // doesn't clobber scratch_b mid-sequence when scratch_b == rax.
         {
             x86_self_locate(e, cfg.scratch_b, FixupKind::RuntimeNonce);
-            e.mov_reg_mem(rx::rax, cfg.scratch_b, 0, true);
+            e.mov_reg_mem(cfg.scratch_a, cfg.scratch_b, 0, true);
             e.mov_mem_reg(
                 cfg.state_ptr,
                 static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86,
-                rx::rax,
+                cfg.scratch_a,
                 true
             );
-            e.mov_reg_mem(rx::rax, cfg.scratch_b, 4, true);
+            e.mov_reg_mem(cfg.scratch_a, cfg.scratch_b, 4, true);
             e.mov_mem_reg(
                 cfg.state_ptr,
                 static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86 + 4,
-                rx::rax,
+                cfg.scratch_a,
                 true
             );
         }
@@ -528,7 +534,7 @@ namespace mkpivm {
 
         emit_prologue(e, data_island_size);
 
-        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + 256;
+        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + vm_.frame_padding();
         const std::uint32_t aligned_frame = (frame_size + 15) & ~15u;
 
         // volatile GPRs eax/ecx/edx into VM slot low halves.
@@ -643,6 +649,42 @@ namespace mkpivm {
             rx::rax,
             true
         ); // [VM_RSP] = exit_handler
+
+        // --coro-prelo N: copy N dwords from real_stack[0..N*4] onto VM_RSP
+        // at range entry
+        if (vm_.coro_prelo() > 0) {
+            const std::uint32_t prelo_n = vm_.coro_prelo();
+            const std::uint32_t frame_size_p = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + vm_.frame_padding();
+            const std::uint32_t aligned_p = (frame_size_p + 15) & ~15u;
+
+            // x86 prologue: 4 NV pushes + pushfd = 20B before
+            // sub esp + lea state_ptr.
+            const std::int32_t native_esp_delta = static_cast<std::int32_t>(aligned_p) + 20 - static_cast<std::int32_t>(vm_.shadow_stack_bytes());
+            const std::uint8_t sp_slot_p = vm_.slot_of_xreg(XReg::SP);
+            const std::int32_t sp_off_p  = static_cast<std::int32_t>(st.regs_base + sp_slot_p * 8);
+
+            // ecx = native_entry_esp.
+            e.lea_reg_mem(rx::rcx, cfg.state_ptr, rx::none, 0, native_esp_delta);
+
+            // edx = current VM_RSP slot value.
+            e.mov_reg_mem(rx::rdx, cfg.state_ptr, sp_off_p, true);
+
+            // push real[N-1] first, down to real[0]
+            for (std::int32_t i = static_cast<std::int32_t>(prelo_n) - 1; i >= 0; --i) {
+                e.mov_reg_mem(rx::rax, rx::rcx, i * 4, true);
+                e.sub_reg_imm32(rx::rdx, 4, true);
+                e.mov_mem_reg(rx::rdx, 0, rx::rax, true);
+            }
+            e.mov_mem_reg(cfg.state_ptr, sp_off_p, rx::rdx, true);
+
+            // BP_slot override: when --coro-prelo > 0, shadow stack mirrors
+            // the top N dwords of real stack at range entry
+            const std::uint8_t bp_slot_p = vm_.slot_of_xreg(XReg::BP);
+            const std::int32_t bp_off_p  = static_cast<std::int32_t>(st.regs_base + bp_slot_p * 8);
+            e.mov_mem_reg(cfg.state_ptr, bp_off_p, rx::rdx, true);
+            e.xor_reg_reg(rx::rax, rx::rax, true);
+            e.mov_mem_reg(cfg.state_ptr, bp_off_p + 4, rx::rax, true);
+        }
 
         if (bytecode_offset != 0) {
             e.add_reg_imm32(cfg.ip, static_cast<std::int32_t>(bytecode_offset), true);
@@ -761,7 +803,7 @@ namespace mkpivm {
             true
         );
 
-        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + 256;
+        const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + vm_.frame_padding();
         const std::uint32_t aligned = (frame_size + 15) & ~15u;
         e.add_reg_imm32(rx::rsp, static_cast<std::int32_t>(aligned));
 
@@ -774,10 +816,8 @@ namespace mkpivm {
         e.ret();
     }
 
-    void VMCodeGen::emit_full(X86Emitter& e,
-                              std::size_t /*bytecode_size*/,
-                              std::size_t data_island_size,
-                              std::uint32_t block_table_count) {
+    void VMCodeGen::emit_full(X86Emitter& e, std::size_t /*bytecode_size*/,
+                              std::size_t data_island_size, std::uint32_t block_table_count) {
         if (range_mode_) {
             off_.range_entries.assign(range_entry_bc_offsets_.size(), 0);
             for (std::size_t k = 0; k < range_entry_bc_offsets_.size(); ++k) {

@@ -96,10 +96,10 @@ namespace mkpivm {
             std::vector<std::uint32_t>      range_entry_bc_offsets_{};
 
             // cached NV-push order
-            std::array<std::uint8_t, 8> cached_nv_order_x64_{};
-            bool                        cached_nv_order_x64_set_{false};
-            std::array<std::uint8_t, 4> cached_nv_order_x86_{};
-            bool                        cached_nv_order_x86_set_{false};
+            std::array<std::uint8_t, 8>     cached_nv_order_x64_{};
+            bool                            cached_nv_order_x64_set_{false};
+            std::array<std::uint8_t, 4>     cached_nv_order_x86_{};
+            bool                            cached_nv_order_x86_set_{false};
 
             void emit_prologue(X64Emitter& e, std::size_t data_island_size);
             void emit_state_init(

@@ -114,7 +114,7 @@ namespace mkpivm {
                 if (sub.uniform(0, 99) < static_cast<int>(density_pct)) {
                     const XReg tmp_reg = (sub.pick(2) == 0) ? XReg::Tmp2 : XReg::Tmp3;
 
-                    IRInsn dead;
+                    IRInsn          dead;
                     dead.op       = IROp::IMM;
                     dead.width    = Width::Q;
                     dead.ops[0]   = VirReg{tmp_reg, Width::Q, false};
@@ -167,7 +167,7 @@ namespace mkpivm {
             splits.push_back({bi, target_id});
         }
 
-        // apply splits in reverse so earlier indices stay valid
+        // apply splits in reverse so earlier indices stay valid.
         for (auto it = splits.rbegin(); it != splits.rend(); ++it) {
             const std::size_t bi      = it->blk_idx;
             const std::uint32_t tgt_id = it->target_id;
@@ -213,7 +213,7 @@ namespace mkpivm {
         }
     }
 
-    // runs the IR through the codecs and hands back raw plaintext bytecode
+    // runs the IR through the codecs and hands back raw plaintext bytecode.
     static std::vector<std::uint8_t> encode_bytecode(const IRProgram& prog, const VMConfig& vm, const CodecRegistry& codecs) {
         BytecodeBuilder bb;
 
@@ -331,6 +331,12 @@ namespace mkpivm {
         }
         if (opt.range_leak_nvs) {
             vm.set_range_leak_nvs(true);
+        }
+        if (opt.coro_prelo) {
+            vm.set_coro_prelo(opt.coro_prelo);
+        }
+        if (opt.heap_stack) {
+            vm.set_heap_stack(true);
         }
 
         // headroom scan
@@ -459,11 +465,7 @@ namespace mkpivm {
                 range_bc_offsets.push_back(block_id_to_bc_off.at(bid));
             }
 
-            // rip-via-call. each unique ret_va that the shellcode treats as
-            // a self-pointer needs its own entry stub so the eventual native
-            // `call reg` doesnt fly into the int3 fill. dormant for now,
-            // lifter side of the pattern detect isnt wired up yet, see
-            // feedback_cobalt_stager_range_limit mental note
+            // rip-via-call
             std::vector<std::pair<std::uint32_t /*va_off*/, std::uint32_t /*stub_idx*/>> rip_via_call_stubs;
             {
                 std::unordered_set<std::uint64_t> seen;
@@ -539,6 +541,11 @@ namespace mkpivm {
                 const std::size_t block_table_offset = data_island_offset + island.size();
                 (void)data_island_offset; (void)block_table_offset;
 
+                // rip-via-call targets: `call X; X: pop reg` shit. the byte
+                // at return_va is real code, jump there.
+                std::unordered_set<std::uint64_t> rip_via_call_set(
+                    prog.rip_via_call_targets.begin(), prog.rip_via_call_targets.end());
+
                 // patch trampoline_fixups in the bytecode
                 for (const auto& tf : tramp_fixups) {
                     auto it = return_va_to_trampoline_idx.find(tf.return_va);
@@ -546,10 +553,22 @@ namespace mkpivm {
 
                     if (it != return_va_to_trampoline_idx.end()) {
                         off = static_cast<std::int64_t>(trampoline_offsets[it->second]);
-                    } 
-                    else if (tf.return_va > opt.base_va && tf.return_va < opt.base_va + shellcode.size) {
+                    }
+                    else if (rip_via_call_set.count(tf.return_va) &&
+                             tf.return_va > opt.base_va &&
+                             tf.return_va < opt.base_va + shellcode.size) {
+                        // rip-via-call: jump to the native byte, the pop reg.
                         off = static_cast<std::int64_t>(tf.return_va - opt.base_va) -
                             static_cast<std::int64_t>(shellcode.size) -
+                            static_cast<std::int64_t>(trampoline_region_offset);
+                    }
+                    else if (tf.return_va > opt.base_va && tf.return_va < opt.base_va + shellcode.size) {
+                        // return_va sits in data. no cfg block, not rip-via-call.
+                        // either the api never returns, or the shellcode falls
+                        // into a string. jumping to a data byte runs garbage as
+                        // code. route to exit_handler so we bail clean if the
+                        // api does return.
+                        off = static_cast<std::int64_t>(gen.offsets().exit_handler) -
                             static_cast<std::int64_t>(trampoline_region_offset);
                     }
                     else {
@@ -672,6 +691,26 @@ namespace mkpivm {
                 const std::size_t stub_base = blob.size();
                 blob.insert(blob.end(), bytes.begin(), bytes.end());
 
+                // is_code[] for the lifted range. int3-filling data bytes
+                // shits all over strings/tables that lifted LEAs still point
+                // at, so skip them. same trick as the default-mode loop below.
+                std::vector<bool> range_is_code(shellcode.size, false);
+                for (const auto& b : cfg.blocks()) {
+                    const std::uint64_t s = b.start_va < opt.base_va ? 0 : (b.start_va - opt.base_va);
+                    const std::uint64_t e = b.end_va  < opt.base_va ? 0 : (b.end_va   - opt.base_va);
+                    for (std::uint64_t i = s; i < e && i < shellcode.size; ++i) range_is_code[i] = true;
+                }
+                // a string that starts on an instruction boundary the cfg
+                // wandered into looks like code. demote it back to data.
+                constexpr std::uint32_t kRangeFixupPromoteSpan = 1024;
+                for (const auto& df : data_fixups) {
+                    if (df.va < opt.base_va || df.va >= opt.base_va + shellcode.size) continue;
+                    const std::uint32_t vo = static_cast<std::uint32_t>(df.va - opt.base_va);
+                    for (std::uint32_t k = 0; k < kRangeFixupPromoteSpan && vo + k < shellcode.size; ++k) {
+                        range_is_code[vo + k] = false;
+                    }
+                }
+
                 // patch each range start with jmp rel32 to vm_entry_K
                 const auto& range_entries = gen.offsets().range_entries;
                 for (std::size_t k = 0; k < opt.ranges.size(); ++k) {
@@ -687,8 +726,10 @@ namespace mkpivm {
 
                     for (int i = 0; i < 4; ++i) blob[start + 1 + i] = static_cast<std::uint8_t>(r >> (8 * i));
 
-                    // fill the rest of the range with int3
-                    for (std::uint32_t p = patch_end; p < end; ++p) blob[p] = 0xCC;
+                    // int3-fill only code. data bytes are still lea targets.
+                    for (std::uint32_t p = patch_end; p < end; ++p) {
+                        if (p < shellcode.size && range_is_code[p]) blob[p] = 0xCC;
+                    }
                 }
 
                 // splat a jmp rel32 over the int3 fill at each rip-via-call

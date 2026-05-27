@@ -342,8 +342,7 @@ namespace mkpivm {
 
     // extract architectural register-operand value from a 64-bit slot,
     // honoring the width byte 
-    static void emit_extract_operand(X64Emitter& e, const VMConfig& vm,
-                                     std::uint8_t reg, std::uint8_t width_reg) {
+    static void emit_extract_operand(X64Emitter& e, const VMConfig& vm, std::uint8_t reg, std::uint8_t width_reg) {
         const std::uint8_t T = pick_temp_reg(vm, 0xE107AC7117ULL, {reg, width_reg});
         e.push_reg(T);
 
@@ -1733,8 +1732,7 @@ namespace mkpivm {
         }
     }
 
-    static void emit_shift_handler(X64Emitter& e, const VMConfig& vm,
-                                   void (X64Emitter::*op_cl)(std::uint8_t, bool)) {
+    static void emit_shift_handler(X64Emitter& e, const VMConfig& vm, void (X64Emitter::*op_cl)(std::uint8_t, bool)) {
         const auto& r = vm.dispatcher_regs();
         emit_fetch_byte_dec(e, vm, r.scratch_a); // dst slot
         emit_fetch_byte_dec(e, vm, r.scratch_b); // dst width
@@ -1775,6 +1773,7 @@ namespace mkpivm {
             0,
             true
         ); // rdx = saved width byte
+
         e.and_reg_imm32(rx::rdx, 0x7F);
         e.cmp_reg_imm32(rx::rdx, 8);
         e.jcc_label(cc::z, lbl_w8_shift);
@@ -2115,7 +2114,7 @@ namespace mkpivm {
         const std::uint8_t R_PRED   = pool[5];  // predicate accumulator
 
         emit_fetch_byte_dec(e, vm, r.scratch_a); // cond
-        emit_fetch_u32_dec(e, vm, r.scratch_b); // rel32
+        emit_fetch_u32_dec(e, vm, r.scratch_b);  // rel32
         e.movsxd_r64_r32(r.scratch_b, r.scratch_b);
         e.mov_reg_mem(
             R_RESULT,
@@ -2197,12 +2196,14 @@ namespace mkpivm {
         // CF = a < b unsigned, SUB semantic, via setb after cmp.
         e.cmp_reg_reg(R_A, R_B);
         setcc(cc::b, R_RESULT); // R_RESULT = cf_byte
+
         e.movzx_r64_r8(R_RESULT, R_RESULT);
         const std::uint8_t cf_byte = R_RESULT;
 
         // signed less-than via setl after the same cmp.
         e.cmp_reg_reg(R_A, R_B);
         setcc(cc::l, R_B); // R_B = lt_byte
+
         e.movzx_r64_r8(R_B, R_B);
         const std::uint8_t lt_byte = R_B;
 
@@ -2617,8 +2618,12 @@ namespace mkpivm {
         const auto& st = vm.state_layout();
 
         // operand stream: [u32 return_va_offset_in_data_island][u8 tgt_tag][payload]
-        const std::int32_t saved_ret_off = static_cast<std::int32_t>(st.cipher_extra) + kSavedTargetOff + 16;
+        constexpr std::int32_t kRangeRetSignOff = 64;
+        const std::int32_t saved_ret_off  = static_cast<std::int32_t>(st.cipher_extra) + kSavedTargetOff + 16;
+        const std::int32_t range_sign_off = static_cast<std::int32_t>(st.cipher_extra) + kRangeRetSignOff;
         emit_fetch_u32_dec(e, vm, r.scratch_b);
+        e.movsxd_r64_r32(r.scratch_b, r.scratch_b);
+        e.mov_mem_reg(r.state_ptr, range_sign_off, r.scratch_b, true);
         e.mov_reg_mem(
             rx::rax,
             r.state_ptr,
@@ -2633,6 +2638,8 @@ namespace mkpivm {
             true
         );
 
+        // VM_RSP push
+        const bool range_mode_call = vm.range_mode() && !vm.pack_mode() && !is_jmp;
         if (!is_jmp) {
             const std::uint8_t rsp_slot = vm.slot_of_xreg(XReg::SP);
             const std::int32_t rsp_off = static_cast<std::int32_t>(st.regs_base + rsp_slot * 8);
@@ -2833,7 +2840,7 @@ namespace mkpivm {
                 true
             );
 
-            const std::uint32_t frame_size = static_cast<std::uint32_t>(vm.state_layout().total_size) + vm.shadow_stack_bytes() + 256;
+            const std::uint32_t frame_size = static_cast<std::uint32_t>(vm.state_layout().total_size) + vm.shadow_stack_bytes() + vm.frame_padding();
             const std::uint32_t aligned_frame = (frame_size + 15) & ~15u;
 
             e.mov_reg_mem(
@@ -2857,14 +2864,8 @@ namespace mkpivm {
 
             // --range-leak-nvs. blast current VMState NV slots over the
             // prologue stack saves so exit_handler's pop sequence picks up
-            // what the lifted range actually wrote instead of the stale
-            // caller-side values. off by default because function-shaped
-            // ranges hit this path on mid-flow escapes and trashing the
-            // caller's nvs would just be a dick move. flip it on for
-            // straight-line partial lifts where downstream native bytes
-            // need to see what the lifted code wrote. rcx still points at
-            // caller_retaddr. NV[i] = po.order[i] sits at saved_rsp +
-            // aligned + 64 - 8*i, which off rcx is rcx - 8*(i+1).
+            // what the lifted range actually wrote instead of the stale,
+            // shitty caller-side values
             if (vm.range_leak_nvs()) {
                 if (const auto* order = prologue_order_for(e)) {
                     auto host_to_xreg = [](std::uint8_t reg) -> XReg {
@@ -2878,6 +2879,7 @@ namespace mkpivm {
                         if (reg == rx::r15) return XReg::R15;
                         return XReg::Invalid;
                     };
+
                     for (std::size_t i = 0; i < order->size(); ++i) {
                         const std::uint8_t nv_reg = (*order)[i];
                         const XReg xr = host_to_xreg(nv_reg);
@@ -2925,7 +2927,150 @@ namespace mkpivm {
                 static_cast<std::int32_t>(vm.state_layout().regs_base + vm.slot_of_xreg(XReg::AX) * 8),
                 true
             );
+
+            // range-mode JMP_NATIVE api_path. support for --heap-stack
+            // and shadow-stack default
+            {
+                const auto host_to_xreg_j = [](std::uint8_t reg) -> XReg {
+                    if (reg == rx::rbx) return XReg::BX;
+                    if (reg == rx::rbp) return XReg::BP;
+                    if (reg == rx::rdi) return XReg::DI;
+                    if (reg == rx::rsi) return XReg::SI;
+                    if (reg == rx::r12) return XReg::R12;
+                    if (reg == rx::r13) return XReg::R13;
+                    if (reg == rx::r14) return XReg::R14;
+                    if (reg == rx::r15) return XReg::R15;
+                    return XReg::Invalid;
+                };
+                const XReg sp_xreg_j = host_to_xreg_j(sp);
+                if (sp_xreg_j != XReg::Invalid) {
+                    if (vm.heap_stack()) {
+                        // heap stack
+                        e.mov_reg_mem(
+                            rx::r10,
+                            sp,
+                            static_cast<std::int32_t>(vm.state_layout().regs_base + vm.slot_of_xreg(XReg::SP) * 8),
+                            true
+                        );
+                        e.mov_reg_mem(rx::r10, rx::r10, 0, true);
+
+                        // target -> r11, jmp r11 at end
+                        e.mov_reg_mem(
+                            rx::r11,
+                            sp,
+                            static_cast<std::int32_t>(st.cipher_extra) + kSavedTargetOff,
+                            true
+                        );
+
+                        // compute new rsp
+                        const std::uint32_t frame_size_h = static_cast<std::uint32_t>(vm.state_layout().total_size) + vm.shadow_stack_bytes() + vm.frame_padding();
+                        const std::uint32_t aligned_h = (frame_size_h + 15) & ~15u;
+                        const std::int32_t  native_rsp_delta_h = static_cast<std::int32_t>(aligned_h) + 72 - static_cast<std::int32_t>(vm.shadow_stack_bytes());
+                        e.lea_reg_mem(rx::rsp, sp, rx::none, 0, native_rsp_delta_h + 0x08);
+
+                        // write retaddr at [rsp]
+                        e.mov_mem_reg(rx::rsp, 0, rx::r10, true);
+
+                        // put state_ptr-host-reg's lifted slot back into it
+                        e.mov_reg_mem(
+                            sp,
+                            sp,
+                            static_cast<std::int32_t>(vm.state_layout().regs_base + vm.slot_of_xreg(sp_xreg_j) * 8),
+                            true
+                        );
+
+                        // jmp target r11, rax stays = AX_slot, rcx = CX_slot, etc
+                        e.jmp_reg(rx::r11);
+                        return;
+                    }
+
+                    // shadow-stack default
+                    e.mov_reg_mem(
+                        rx::rcx,
+                        sp,
+                        static_cast<std::int32_t>(st.cipher_extra) + kSavedTargetOff,
+                        true
+                    );
+                    e.mov_reg_mem(
+                        rx::rsp,
+                        sp,
+                        static_cast<std::int32_t>(vm.state_layout().regs_base + vm.slot_of_xreg(XReg::SP) * 8),
+                        true
+                    );
+                    e.mov_reg_mem(
+                        sp,
+                        sp,
+                        static_cast<std::int32_t>(vm.state_layout().regs_base + vm.slot_of_xreg(sp_xreg_j) * 8),
+                        true
+                    );
+                    e.jmp_reg(rx::rcx);
+                    return;
+                }
+            }
             // fall through to the normal path: rsp = VM_RSP, jmp via mem.
+        }
+
+        // range-mode CALL_NATIVE
+        if (range_mode_call) {
+            auto lbl_in_range = e.new_label();
+
+            // load the saved signed offset; if non-negative branch to the
+            // default tail
+            e.mov_reg_mem(rx::rax, sp, range_sign_off, true);
+            e.test_reg_reg(rx::rax, rx::rax, true);
+            e.jcc_label(cc::ns, lbl_in_range);
+
+            // if out of range, real stack disp
+            const std::uint32_t frame_size_b = static_cast<std::uint32_t>(vm.state_layout().total_size) + vm.shadow_stack_bytes() + vm.frame_padding();
+            const std::uint32_t aligned_frame_b = (frame_size_b + 15) & ~15u;
+            const std::int32_t native_rsp_delta = static_cast<std::int32_t>(aligned_frame_b) + 72 - static_cast<std::int32_t>(vm.shadow_stack_bytes());
+
+            const auto host_to_xreg = [](std::uint8_t reg) -> XReg {
+                if (reg == rx::rbx) return XReg::BX;
+                if (reg == rx::rbp) return XReg::BP;
+                if (reg == rx::rdi) return XReg::DI;
+                if (reg == rx::rsi) return XReg::SI;
+                if (reg == rx::r12) return XReg::R12;
+                if (reg == rx::r13) return XReg::R13;
+                if (reg == rx::r14) return XReg::R14;
+                if (reg == rx::r15) return XReg::R15;
+                return XReg::Invalid;
+            };
+            const XReg sp_xreg = host_to_xreg(sp);
+            const std::int32_t sp_slot_off = (sp_xreg == XReg::Invalid) ? 0 : static_cast<std::int32_t>(vm.state_layout().regs_base + vm.slot_of_xreg(sp_xreg) * 8);
+
+            // rsp = native_entry_rsp - 8
+            e.lea_reg_mem(rx::rsp, sp, rx::none, 0, native_rsp_delta - 8);
+
+            // push ret_va_ptr onto real stack.
+            e.mov_reg_mem(rx::rcx, sp, saved_ret_off, true);
+            e.mov_mem_reg(rx::rsp, 0, rx::rcx, true);
+
+            // target -> rcx
+            e.mov_reg_mem(
+                rx::rcx,
+                sp,
+                static_cast<std::int32_t>(st.cipher_extra) + kSavedTargetOff,
+                true
+            );
+
+            // restore rax from the AX slot
+            e.mov_reg_mem(
+                rx::rax,
+                sp,
+                static_cast<std::int32_t>(vm.state_layout().regs_base + vm.slot_of_xreg(XReg::AX) * 8),
+                true
+            );
+
+            // splat state_ptr-host-reg's lifted slot back into it.
+            if (sp_xreg != XReg::Invalid) {
+                e.mov_reg_mem(sp, sp, sp_slot_off, true);
+            }
+
+            e.jmp_reg(rx::rcx);
+
+            // in-range path falls through to the default tail.
+            e.bind(lbl_in_range);
         }
 
         // set rsp = VM_RSP. must be the last gpr materialization.

@@ -3,6 +3,8 @@
 #include "mkpivm/pe_embed.h"
 #include "mkpivm/util.h"
 
+#include <Zydis/Zydis.h>
+
 #include <fmt/format.h>
 #include <deque>
 #include <set>
@@ -58,6 +60,20 @@ namespace {
             "                        the caller's nvs. use it for straight-line partial\n"
             "                        lifts where downstream native bytes need to see what\n"
             "                        the lifted code wrote.\n"
+            "  --coro-prelo N        coroutine pre-load: copy N qwords from real_stack[0..N*8]\n"
+            "                        onto VM_RSP at range entry. needed when native code\n"
+            "                        pushed values BEFORE the range entry that lifted POPs\n"
+            "                        inside the range expect to pop. e.g. cobalt's API\n"
+            "                        resolver enters via `call rbp` then does 5 startup pushes\n"
+            "                        natively before the patched VM entry at 0x21; use --coro-prelo\n"
+            "                        6 for that range.\n"
+            "  --heap-stack          switch VM dispatcher to a blob-embedded 64 KB static\n"
+            "                        stack region instead of running on the host's real\n"
+            "                        stack. caller's rsp is saved at prologue and restored\n"
+            "                        at every native dispatch so external Win APIs get full\n"
+            "                        caller-stack frame room. resolves the conflict where\n"
+            "                        chained API calls would otherwise have to share rsp with\n"
+            "                        VM dispatcher scratch.\n"
             "  --pack                packer mode: don't lift the input. wrap it as encrypted\n"
             "                        data carried by the per-seed polymorphic vm: cipher,\n"
             "                        reg shuffle, handler-table encryption, all of it. at\n"
@@ -357,8 +373,7 @@ namespace {
 
     // --scan: build the cfg and dump every call-target function that's eligible
     // for --ranges virtualization 
-    void run_scan(const std::vector<std::uint8_t>& bytes, mkpivm::Arch arch,
-                  std::uint64_t base_va) {
+    void run_scan(const std::vector<std::uint8_t>& bytes, mkpivm::Arch arch, std::uint64_t base_va) {
         mkpivm::Span<std::uint8_t> code{bytes.data(), bytes.size()};
         mkpivm::CFGBuilder cfg{arch, code, base_va};
         cfg.build();
@@ -383,9 +398,92 @@ namespace {
             bool                    is_call_target;
             bool                    is_jmp_target;
             bool                    external_entries;
+            std::uint32_t           coro_prelo_n;     // max-depth-below-initial of stack balance
+            bool                    needs_heap_stack; // range has a `jmp REG` or `jmp [MEM]`
             std::set<std::uint64_t> reachable_va_starts; // dedup helper
         };
         std::vector<Candidate> cands;
+
+        ZydisDecoder zdec;
+        if (arch == mkpivm::Arch::X64) {
+            ZydisDecoderInit(&zdec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+        } else {
+            ZydisDecoderInit(&zdec, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
+        }
+
+        auto analyze_range = [&](std::uint64_t start_va, std::uint64_t end_va,
+                                 std::uint32_t& out_prelo, bool& out_heap_stack)
+        {
+            out_prelo = 0;
+            out_heap_stack = false;
+
+            std::int32_t balance     = 0;
+            std::int32_t min_balance = 0;
+
+            std::uint64_t va = start_va;
+            while (va < end_va) {
+                if (!cfg.code_vas().count(va)) {
+                    // mid-instruction byte or data island; skip a byte
+                    va += 1;
+                    continue;
+                }
+                const std::size_t off = static_cast<std::size_t>(va - base_va);
+                if (off >= bytes.size()) break;
+
+                ZydisDecodedInstruction insn;
+                ZydisDecodedOperand     ops[ZYDIS_MAX_OPERAND_COUNT];
+                const std::size_t avail = std::min<std::size_t>(15, bytes.size() - off);
+                const ZyanStatus st = ZydisDecoderDecodeFull(
+                    &zdec, bytes.data() + off, avail, &insn, ops
+                );
+                if (!ZYAN_SUCCESS(st)) {
+                    va += 1;
+                    continue;
+                }
+
+                switch (insn.mnemonic) {
+                    case ZYDIS_MNEMONIC_PUSH:
+                    case ZYDIS_MNEMONIC_PUSHF:
+                    case ZYDIS_MNEMONIC_PUSHFD:
+                    case ZYDIS_MNEMONIC_PUSHFQ:
+                        balance += 1;
+                        break;
+                    case ZYDIS_MNEMONIC_POP:
+                    case ZYDIS_MNEMONIC_POPF:
+                    case ZYDIS_MNEMONIC_POPFD:
+                    case ZYDIS_MNEMONIC_POPFQ:
+                        balance -= 1;
+                        if (balance < min_balance) min_balance = balance;
+                        break;
+                    case ZYDIS_MNEMONIC_PUSHA:
+                    case ZYDIS_MNEMONIC_PUSHAD:
+                        // x86 pushad/pusha pushes 8/4 registers
+                        balance += 8;
+                        break;
+                    case ZYDIS_MNEMONIC_POPA:
+                    case ZYDIS_MNEMONIC_POPAD:
+                        balance -= 8;
+                        if (balance < min_balance) min_balance = balance;
+                        break;
+                    case ZYDIS_MNEMONIC_JMP:
+                        // indirect jmp
+                        if (insn.operand_count_visible >= 1 &&
+                            ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+                        {
+                            out_heap_stack = true;
+                        }
+                        break;
+                    default:
+                        break;
+                }
+
+                va += insn.length;
+            }
+
+            if (min_balance < 0) {
+                out_prelo = static_cast<std::uint32_t>(-min_balance);
+            }
+        };
 
         for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
             // enumerate any block that's a static entry from somewhere else in
@@ -454,6 +552,10 @@ namespace {
                 if (external_entries) break;
             }
 
+            std::uint32_t prelo_n = 0;
+            bool          needs_heap = false;
+            analyze_range(blocks[bi].start_va, max_va, prelo_n, needs_heap);
+
             cands.push_back(
                 {
                     blocks[bi].start_va, max_va, seen.size(),
@@ -461,6 +563,7 @@ namespace {
                     blocks[bi].is_call_target,
                     blocks[bi].is_jmp_target,
                     external_entries,
+                    prelo_n, needs_heap,
                     std::move(reachable)
                 }
             );
@@ -514,6 +617,20 @@ namespace {
             return "jmp     "; // jmp-only entry, tail-call pattern
         };
         
+        // helper: append " --coro-prelo N --heap-stack" if needed
+        auto append_extras = [](char* buf, std::size_t cap, const Candidate& c) {
+            std::size_t used = 0;
+            if (c.coro_prelo_n > 0) {
+                int n = std::snprintf(buf + used, cap - used, " --coro-prelo %u", c.coro_prelo_n);
+                if (n > 0) used += static_cast<std::size_t>(n);
+            }
+            if (c.needs_heap_stack && used < cap) {
+                int n = std::snprintf(buf + used, cap - used, " --heap-stack");
+                if (n > 0) used += static_cast<std::size_t>(n);
+            }
+            return used;
+        };
+
         std::fprintf(stderr, "eligible entry points:\n");
         std::size_t ok = 0;
         for (std::size_t i = 0; i < cands.size(); ++i) {
@@ -523,23 +640,27 @@ namespace {
             const std::uint64_t s = c.entry_va - base_va;
             const std::uint64_t e = c.end_va   - base_va;
 
+            char extras[64] = {0};
+            append_extras(extras, sizeof(extras), c);
+
             std::fprintf(
                 stderr,
-                "  %s  0x%06llx..0x%06llx  %4llu B, %2zu blocks  --ranges 0x%llx:0x%llx\n",
+                "  %s  0x%06llx..0x%06llx  %4llu B, %2zu blocks  --ranges 0x%llx:0x%llx%s\n",
                 entry_tag(c),
                 static_cast<unsigned long long>(s),
                 static_cast<unsigned long long>(e),
                 static_cast<unsigned long long>(e - s),
                 c.block_count,
                 static_cast<unsigned long long>(s),
-                static_cast<unsigned long long>(e)
+                static_cast<unsigned long long>(e),
+                extras
             );
 
             ++ok;
         }
         if (ok == 0) std::fprintf(stderr, "  none\n");
 
-        // coroutine candidates: not ret-terminated but otherwise clean 
+        // coroutine candidates: not ret-terminated but otherwise clean
         std::size_t shown_coro = 0;
         for (std::size_t i = 0; i < cands.size(); ++i) {
             if (shadowed[i]) continue;
@@ -549,16 +670,21 @@ namespace {
 
             const std::uint64_t s = c.entry_va - base_va;
             const std::uint64_t e = c.end_va   - base_va;
+
+            char extras[64] = {0};
+            append_extras(extras, sizeof(extras), c);
+
             std::fprintf(
                 stderr,
-                "  %s  0x%06llx..0x%06llx  %4llu B, %2zu blocks  --coroutines --ranges 0x%llx:0x%llx\n",
+                "  %s  0x%06llx..0x%06llx  %4llu B, %2zu blocks  --coroutines --ranges 0x%llx:0x%llx%s\n",
                 entry_tag(c),
                 static_cast<unsigned long long>(s),
                 static_cast<unsigned long long>(e),
                 static_cast<unsigned long long>(e - s),
                 c.block_count,
                 static_cast<unsigned long long>(s),
-                static_cast<unsigned long long>(e)
+                static_cast<unsigned long long>(e),
+                extras
             );
 
             ++shown_coro;
@@ -821,6 +947,12 @@ int main(int argc, char** argv) {
             }
             else if (a == "--range-leak-nvs") {
                 opt.range_leak_nvs = true;
+            }
+            else if (a == "--coro-prelo" && i + 1 < argc) {
+                opt.coro_prelo = static_cast<std::uint32_t>(std::stoul(argv[++i], nullptr, 0));
+            }
+            else if (a == "--heap-stack") {
+                opt.heap_stack = true;
             }
             else if (a == "--embed-into" && i + 1 < argc) {
                 embed_target = argv[++i];

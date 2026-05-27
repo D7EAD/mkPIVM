@@ -209,7 +209,7 @@ namespace mkpivm {
 
         // from each leader, walk forward until we hit a terminator like ret or
         // unconditional jmp, or until we reach the next leader.
-        auto next_leader = [&](std::uint64_t after)->std::uint64_t {
+        auto next_leader = [&](std::uint64_t after) -> std::uint64_t {
             auto it = std::upper_bound(sorted_leaders.begin(), sorted_leaders.end(), after);
             return it == sorted_leaders.end() ? UINT64_MAX : *it;
         };

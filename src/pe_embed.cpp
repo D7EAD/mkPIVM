@@ -552,9 +552,7 @@ namespace mkpivm {
             std::size_t call_iat_abs32_off{0};  // absolute va of iat slot
             std::size_t push_blob_abs32_off{0}; // absolute va to push for arg3, vm_blob
         };
-        WrapperLayout emit_wrapper_x86_threaded(const std::uint8_t* displaced,
-                                                std::uint32_t dlen,
-                                                ThreadedFixupsX86& fx) {
+        WrapperLayout emit_wrapper_x86_threaded(const std::uint8_t* displaced, std::uint32_t dlen, ThreadedFixupsX86& fx) {
             WrapperLayout w;
             auto& b = w.bytes;
 

@@ -198,8 +198,7 @@ namespace mkpivm {
         ir.add(convert_operand(src, w));
     }
 
-    static void emit_unaryop_with_mem(IRBuilder& b, IROp op, FlagsOp fk, Width w,
-                                      const ZydisDecodedOperand& dst) {
+    static void emit_unaryop_with_mem(IRBuilder& b, IROp op, FlagsOp fk, Width w, const ZydisDecodedOperand& dst) {
         if (dst.type == ZYDIS_OPERAND_TYPE_MEMORY) {
             Mem m = zmem_to_mem(dst, w);
             b.push(IROp::LOAD, w).add(VirReg{XReg::Tmp0, w, false}).add(m);

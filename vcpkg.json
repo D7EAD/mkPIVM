@@ -1,6 +1,6 @@
 {
   "name": "mkpivm",
-  "version-string": "1.0.1",
+  "version-string": "1.1.0",
   "description": "virtualizing your shellcode for fun and profit",
   "dependencies": [
     "zydis",
