@@ -1,7 +1,9 @@
 #include "mkpivm/vm_codegen.h"
 
 #include <array>
+#include <functional>
 #include <unordered_map>
+#include <vector>
 
 namespace mkpivm {
     namespace {
@@ -11,6 +13,230 @@ namespace mkpivm {
             std::vector<std::uint8_t> order;
         };
         static std::unordered_map<const X86Emitter*, X86PrologueOrder> g_x86_prologue_orders;
+
+        constexpr std::uint32_t kPageReadWrite_x86 = 0x04;
+        constexpr std::uint32_t kPageExecuteRead_x86 = 0x20;
+
+        // Salted ror13+add hashes, shared shape with the x64 PEB walker.
+        std::uint32_t ror_hash_module_x86(const wchar_t* name, std::uint32_t salt) {
+            std::uint32_t h = 0;
+            for (; *name; ++name) {
+                std::uint32_t c = static_cast<std::uint32_t>(*name);
+                if (c >= L'A' && c <= L'Z') c += 32;
+                h = ((h >> 13) | (h << 19)) + c;
+            }
+            return h ^ salt;
+        }
+        std::uint32_t ror_hash_api_x86(const char* name, std::uint32_t salt) {
+            std::uint32_t h = 0;
+            for (; *name; ++name) {
+                std::uint32_t c = static_cast<std::uint8_t>(*name);
+                h = ((h >> 13) | (h << 19)) + c;
+            }
+            return h ^ salt;
+        }
+
+        // x86 in-blob PEB walker
+        void emit_resolve_vp_x86(X86Emitter& e, const VMConfig& vm) {
+            const auto& cfg = vm.dispatcher_regs();
+            const auto& st  = vm.state_layout();
+            const std::uint32_t salt = static_cast<std::uint32_t>(vm.cipher_init_state() ^ 0xC0DEC0DEULL);
+            const std::uint32_t hash_k32 = ror_hash_module_x86(L"kernel32.dll", salt);
+            const std::uint32_t hash_vp  = ror_hash_api_x86("VirtualProtect", salt);
+
+            auto lbl_mod_loop  = e.new_label();
+            auto lbl_mod_hash  = e.new_label();
+            auto lbl_mod_hdone = e.new_label();
+            auto lbl_mod_skip_lc = e.new_label();
+            auto lbl_mod_found = e.new_label();
+            auto lbl_api_loop  = e.new_label();
+            auto lbl_api_hash  = e.new_label();
+            auto lbl_api_hdone = e.new_label();
+            auto lbl_fail      = e.new_label();
+            auto lbl_done      = e.new_label();
+            auto lbl_restore_fail = e.new_label();
+
+            // save all 4 NV regs 
+            e.push_reg(rx::rbx);
+            e.push_reg(rx::rsi);
+            e.push_reg(rx::rdi);
+            e.push_reg(rx::rbp);
+            e.u8(0xFC); // cld lodsb relies on DF=0
+
+            // PEB at fs:[0x30]; Ldr at PEB+0xc
+            e.mov_reg_seg_disp32(rx::rax, /*fs*/1, 0x30, false);
+            e.mov_reg_mem(rx::rax, rx::rax, 0xc, false);
+
+            // ecx = head = &InLoadOrderModuleList
+            e.lea_reg_mem(rx::rcx, rx::rax, rx::none, 0, 0xc);
+
+            // edx = first Flink
+            e.mov_reg_mem(rx::rdx, rx::rcx, 0, false);
+
+            e.bind(lbl_mod_loop);
+            e.cmp_reg_reg(rx::rdx, rx::rcx, false);
+            e.jcc_label(cc::z, lbl_restore_fail);
+
+            // ebx = BaseDllName.Buffer 
+            e.mov_reg_mem(rx::rbx, rx::rdx, 0x30, false);
+            
+            // edi = length (u16 at [edx+0x2c]) >> 1
+            e.mov_reg_mem_size(rx::rdi, rx::rdx, 0x2c, 2, false);
+            e.shr_reg_imm8(rx::rdi, 1, false);
+            
+            // ebp = hash acc
+            e.xor_reg_reg(rx::rbp, rx::rbp, false);
+
+            e.bind(lbl_mod_hash);
+            e.test_reg_reg(rx::rdi, rx::rdi, false);
+            e.jcc_label(cc::z, lbl_mod_hdone);
+            e.mov_reg_mem_size(rx::rax, rx::rbx, 0, 2, false);
+            e.add_reg_imm32(rx::rbx, 2, false);
+            e.cmp_reg_imm32(rx::rax, 'A', false);
+            e.jcc_label(cc::b, lbl_mod_skip_lc);
+            e.cmp_reg_imm32(rx::rax, 'Z', false);
+            e.jcc_label(cc::nbe, lbl_mod_skip_lc);
+            e.add_reg_imm32(rx::rax, 32, false);
+            e.bind(lbl_mod_skip_lc);
+            e.ror_reg_imm8(rx::rbp, 13, false);
+            e.add_reg_reg(rx::rbp, rx::rax, false);
+            e.dec_reg(rx::rdi, false);
+            e.jmp_label(lbl_mod_hash);
+
+            e.bind(lbl_mod_hdone);
+            e.xor_reg_imm32(rx::rbp, static_cast<std::int32_t>(salt), false);
+            e.cmp_reg_imm32(rx::rbp, static_cast<std::int32_t>(hash_k32), false);
+            e.jcc_label(cc::z, lbl_mod_found);
+            e.mov_reg_mem(rx::rdx, rx::rdx, 0, false);
+            e.jmp_label(lbl_mod_loop);
+
+            e.bind(lbl_mod_found);
+
+            // ebx = kernel32 DllBase
+            e.mov_reg_mem(rx::rbx, rx::rdx, 0x18, false);
+
+            // EAT walk. PE32 ExportTable RVA at PE+0x78
+            e.mov_reg_mem(rx::rax, rx::rbx, 0x3c, false);
+            e.mov_reg_mem_sib(rx::rdx, rx::rbx, rx::rax, 0, 0x78, false);
+            e.add_reg_reg(rx::rdx, rx::rbx, false);
+            e.mov_reg_mem(rx::rdi, rx::rdx, 0x18, false); // NumberOfNames
+            e.mov_reg_mem(rx::rcx, rx::rdx, 0x20, false); // AddressOfNames RVA
+            e.add_reg_reg(rx::rcx, rx::rbx, false);
+
+            e.bind(lbl_api_loop);
+            e.dec_reg(rx::rdi, false);
+            e.jcc_label(cc::s, lbl_restore_fail);
+            e.mov_reg_mem_sib(rx::rsi, rx::rcx, rx::rdi, 2, 0, false);
+            e.add_reg_reg(rx::rsi, rx::rbx, false); // esi = name addr
+            e.xor_reg_reg(rx::rbp, rx::rbp, false);
+
+            e.bind(lbl_api_hash);
+            e.u8(0xAC); // lodsb: AL = [ESI++]; relies on DF=0
+            e.test_reg_reg(rx::rax, rx::rax, false); // tests AL via low byte presence
+            e.jcc_label(cc::z, lbl_api_hdone);
+            e.movzx_r32_r8(rx::rax, rx::rax); // ensure high bits clean
+            e.ror_reg_imm8(rx::rbp, 13, false);
+            e.add_reg_reg(rx::rbp, rx::rax, false);
+            e.jmp_label(lbl_api_hash);
+
+            e.bind(lbl_api_hdone);
+            e.xor_reg_imm32(rx::rbp, static_cast<std::int32_t>(salt), false);
+            e.cmp_reg_imm32(rx::rbp, static_cast<std::int32_t>(hash_vp), false);
+            e.jcc_label(cc::nz, lbl_api_loop);
+
+            // resolve ordinal -> function addr in eax.
+            // eax = AddressOfNameOrdinals addr ([edx+0x24] + ebx)
+            e.mov_reg_mem(rx::rax, rx::rdx, 0x24, false);
+            e.add_reg_reg(rx::rax, rx::rbx, false);
+
+            // eax = &ordinal_entry = eax + edi*2
+            e.lea_reg_mem(rx::rax, rx::rax, rx::rdi, 1, 0);
+
+            // esi = ordinal (movzx word)
+            e.mov_reg_mem_size(rx::rsi, rx::rax, 0, 2, false);
+
+            // eax = AddressOfFunctions addr ([edx+0x1c] + ebx)
+            e.mov_reg_mem(rx::rax, rx::rdx, 0x1c, false);
+            e.add_reg_reg(rx::rax, rx::rbx, false);
+
+            // eax = function RVA ([eax + esi*4])
+            e.mov_reg_mem_sib(rx::rax, rx::rax, rx::rsi, 2, 0, false);
+            e.add_reg_reg(rx::rax, rx::rbx, false); // = VirtualProtect addr
+
+            // restore NV regs before storing the result
+            e.pop_reg(rx::rbp);
+            e.pop_reg(rx::rdi);
+            e.pop_reg(rx::rsi);
+            e.pop_reg(rx::rbx);
+
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.vp_addr),
+                rx::rax,
+                false
+            );
+            e.jmp_label(lbl_done);
+
+            e.bind(lbl_restore_fail);
+            e.pop_reg(rx::rbp);
+            e.pop_reg(rx::rdi);
+            e.pop_reg(rx::rsi);
+            e.pop_reg(rx::rbx);
+            e.bind(lbl_fail);
+            e.u8(0xCC); // int3
+            e.bind(lbl_done);
+        }
+
+        // inlined version of x86_self_locate
+        void x86_self_locate_inline(X86Emitter& e, std::uint8_t dst, FixupKind kind) {
+            e.call_rel32(0); // call $+5
+            e.pop_reg(dst);
+            e.u8(0x81);
+            e.emit_modrm(3, 0, dst & 7);
+            const std::size_t patch = e.size();
+            e.u32(0);
+            e.add_fixup(
+                patch,
+                static_cast<std::uint32_t>(kind),
+                0,
+                7
+            );
+        }
+
+        // emit stdcall VirtualProtect(data_island, size, new_protect, &old_protect)
+        void emit_vprotect_call_x86(X86Emitter& e, const VMConfig& vm, std::uint32_t new_protect) {
+            const auto& cfg = vm.dispatcher_regs();
+            const auto& st  = vm.state_layout();
+
+            // push &old_protect (state_ptr + vp_old)
+            e.lea_reg_mem(
+                rx::rax,
+                cfg.state_ptr,
+                rx::none,
+                0,
+                static_cast<std::int32_t>(st.vp_old)
+            );
+            e.push_reg(rx::rax);
+
+            // push new_protect
+            e.push_imm32(static_cast<std::int32_t>(new_protect));
+
+            // push size
+            e.push_imm32(static_cast<std::int32_t>(vm.data_island_size()));
+
+            // push data_island_addr
+            x86_self_locate_inline(e, rx::rax, FixupKind::DataIsland);
+            e.push_reg(rx::rax);
+
+            // eax = [state_ptr + vp_addr]; call eax. stdcall pops the 4 args.
+            e.mov_reg_mem(
+                rx::rax,
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.vp_addr),
+                true
+            );
+            e.u8(0xFF); e.u8(0xD0); // call eax
+        }
     }
 
     const std::vector<std::uint8_t>* prologue_order_for(const X86Emitter& e) {
@@ -70,46 +296,101 @@ namespace mkpivm {
         const auto& cfg = vm_.dispatcher_regs();
         const auto& st  = vm_.state_layout();
 
-        // zero VM regs[]
-        if (!skip_regs_zero) {
-            e.xor_reg_reg(rx::rax, rx::rax, true);
-            for (std::uint8_t i = 0; i < vm_.reg_count(); ++i) {
+        // --rx
+        if (vm_.rx_mode()) {
+            if (vm_.rx_loader_vp()) {
+                const std::uint32_t frame_size = static_cast<std::uint32_t>(vm_.state_layout().total_size) + vm_.shadow_stack_bytes() + vm_.frame_padding();
+                const std::uint32_t aligned = (frame_size + 15) & ~15u;
+
+                // entry esp = current esp + aligned + 4 + 16 + 0; arg at entry esp+4.
+                const std::int32_t arg_off = static_cast<std::int32_t>(aligned + 4 + 16 + 4);
+                e.mov_reg_mem(rx::rax, rx::rsp, arg_off, true);
                 e.mov_mem_reg(
                     cfg.state_ptr,
-                    static_cast<std::int32_t>(st.regs_base + i * 8),
-                    rx::rax,
-                    true
-                );
-                e.mov_mem_reg(
-                    cfg.state_ptr,
-                    static_cast<std::int32_t>(st.regs_base + i * 8 + 4),
+                    static_cast<std::int32_t>(st.vp_addr),
                     rx::rax,
                     true
                 );
             }
+            else {
+                emit_resolve_vp_x86(e, vm_);
+            }
         }
 
-        // cipher state init, 32-bit constants 
+        // zero VM regs[] 
+        if (!skip_regs_zero) {
+            SeedRng zero_rng(vm_.cipher_init_state() ^ 0x2E07117EU);
+            const std::uint8_t zpool[3] = {rx::rax, rx::rcx, rx::rdx};
+
+            // shuffle slot order so consecutive writes aren't sweeping +0, +4, +8...
+            std::vector<std::uint8_t> slot_order(vm_.reg_count());
+            for (std::uint8_t i = 0; i < vm_.reg_count(); ++i) slot_order[i] = i;
+            for (std::size_t i = slot_order.size(); i > 1; --i) {
+                const std::size_t j = zero_rng.pick(static_cast<std::uint32_t>(i));
+                std::swap(slot_order[i - 1], slot_order[j]);
+            }
+
+            std::array<bool, 16> reg_is_zero{};
+
+            auto zero_a_reg = [&](std::uint8_t Z) {
+                switch (zero_rng.pick(3)) {
+                    case 0:  e.xor_reg_reg(Z, Z, true); break;
+                    case 1:  e.sub_reg_reg(Z, Z, true); break;
+                    default: e.mov_reg_imm32(Z, 0, true); break;
+                }
+                reg_is_zero[Z] = true;
+            };
+
+            // mov dword [state+disp], 0 via C7 /0 disp imm32 
+            auto mem_zero_imm = [&](std::int32_t disp) {
+                e.u8(0xC7);
+                e.emit_modrm_mem(0, cfg.state_ptr, rx::none, 0, disp);
+                e.u32(0);
+            };
+
+            auto write_dword_zero = [&](std::int32_t disp) {
+                if (zero_rng.pick(2)) e.poly_nop(zero_rng);
+                switch (zero_rng.pick(5)) {
+                    case 0:
+                    case 1: {
+                        mem_zero_imm(disp);
+                        break;
+                    }
+                    case 2: {
+                        std::uint8_t Z = 0xFF;
+                        for (auto r : zpool) if (reg_is_zero[r]) { Z = r; break; }
+                        if (Z == 0xFF) {
+                            Z = zpool[zero_rng.pick(3)];
+                            zero_a_reg(Z);
+                        }
+                        e.mov_mem_reg(cfg.state_ptr, disp, Z, true);
+                        break;
+                    }
+                    default: {
+                        const std::uint8_t Z = zpool[zero_rng.pick(3)];
+                        zero_a_reg(Z);
+                        e.mov_mem_reg(cfg.state_ptr, disp, Z, true);
+                        break;
+                    }
+                }
+            };
+
+            for (std::uint8_t slot : slot_order) {
+                const std::int32_t lo_disp = static_cast<std::int32_t>(st.regs_base + slot * 8);
+                const std::int32_t hi_disp = lo_disp + 4;
+                if (zero_rng.pick(2)) {
+                    write_dword_zero(lo_disp);
+                    write_dword_zero(hi_disp);
+                }
+                else {
+                    write_dword_zero(hi_disp);
+                    write_dword_zero(lo_disp);
+                }
+            }
+        }
+
+        // cipher init constants
         const std::uint32_t cipher_init32 = static_cast<std::uint32_t>(vm_.cipher_init_state());
-        e.mov_reg_imm32(rx::rax, static_cast<std::int32_t>(cipher_init32), true);
-        e.mov_reg_reg(cfg.cipher_state, rx::rax, true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.cipher_extra) + 48,
-            rx::rax,
-            true
-        );
-
-        // zero the upper 4 bytes of that 8-byte slot for layout consistency.
-        e.xor_reg_reg(rx::rax, rx::rax, true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.cipher_extra) + 48 + 4,
-            rx::rax,
-            true
-        );
-
-        // mult/add constants into VMState 
         std::uint64_t mult = 0, add = 0;
         switch (vm_.cipher_kind()) {
             case CipherKind::ARX:         mult = 0;                     add = vm_.cipher_k1(); break;
@@ -117,108 +398,122 @@ namespace mkpivm {
             case CipherKind::SBoxAdd:     mult = 0x100000001B3ULL;      add = vm_.cipher_k1(); break;
             case CipherKind::FeistelByte: mult = vm_.cipher_k1();       add = vm_.cipher_k2(); break;
         }
-
         constexpr std::int32_t kCipherAddOff  = 0;
         constexpr std::int32_t kCipherMultOff = 8;
-        e.mov_reg_imm32(rx::rax, static_cast<std::int32_t>(add & 0xFFFFFFFFu), true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.cipher_extra) + kCipherAddOff,
-            rx::rax,
-            true
-        );
+        constexpr std::int32_t kCipherInitSlotOff = 48;
 
-        e.xor_reg_reg(rx::rax, rx::rax, true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.cipher_extra) + kCipherAddOff + 4,
-            rx::rax,
-            true
-        );
+        SeedRng init_rng(vm_.cipher_init_state() ^ 0x517A7E1117ULL);
 
-        e.mov_reg_imm32(rx::rax, static_cast<std::int32_t>(mult & 0xFFFFFFFFu), true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.cipher_extra) + kCipherMultOff,
-            rx::rax,
-            true
-        );
+        // pick a zero-write form per call so xor / sub / mov-imm rotate.
+        auto write_zero_dword = [&](std::int32_t disp) {
+            switch (init_rng.pick(3)) {
+                case 0:
+                case 1: {
+                    // mov dword [state+disp], 0
+                    e.u8(0xC7);
+                    e.emit_modrm_mem(0, cfg.state_ptr, rx::none, 0, disp);
+                    e.u32(0);
+                    break;
+                }
+                default: {
+                    e.xor_reg_reg(rx::rax, rx::rax, true);
+                    e.mov_mem_reg(cfg.state_ptr, disp, rx::rax, true);
+                    break;
+                }
+            }
+        };
 
-        e.xor_reg_reg(rx::rax, rx::rax, true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.cipher_extra) + kCipherMultOff + 4,
-            rx::rax,
-            true
-        );
+        // independent init steps 
+        std::vector<std::function<void()>> init_steps;
 
-        // handler_base via call/pop self-locate.
-        x86_self_locate(e, cfg.handler_base, FixupKind::HandlerTable);
-        x86_self_locate(e, cfg.ip, FixupKind::Bytecode);
+        // cipher init: load into cipher_state register AND slot lo. zero hi.
+        init_steps.push_back([&]() {
+            e.mov_reg_imm32(rx::rax, static_cast<std::int32_t>(cipher_init32), true);
+            e.mov_reg_reg(cfg.cipher_state, rx::rax, true);
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.cipher_extra) + kCipherInitSlotOff,
+                rx::rax,
+                true
+            );
+            write_zero_dword(static_cast<std::int32_t>(st.cipher_extra) + kCipherInitSlotOff + 4);
+        });
 
-        // VM_RSP = state_ptr - 4 - headroom. headroom reserves room above
-        // VM_SP for lifted code with positive [esp+disp]/[ebp+disp] reads.
-        // fixed that weird ass bug where 1/N for large shellcode would
-        // remain constant.
-        {
+        // add constant lo + hi zero
+        init_steps.push_back([&]() {
+            e.mov_reg_imm32(rx::rax, static_cast<std::int32_t>(add & 0xFFFFFFFFu), true);
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.cipher_extra) + kCipherAddOff,
+                rx::rax,
+                true
+            );
+            write_zero_dword(static_cast<std::int32_t>(st.cipher_extra) + kCipherAddOff + 4);
+        });
+
+        // mult constant lo + hi zero
+        init_steps.push_back([&]() {
+            e.mov_reg_imm32(rx::rax, static_cast<std::int32_t>(mult & 0xFFFFFFFFu), true);
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.cipher_extra) + kCipherMultOff,
+                rx::rax,
+                true
+            );
+            write_zero_dword(static_cast<std::int32_t>(st.cipher_extra) + kCipherMultOff + 4);
+        });
+
+        init_steps.push_back([&]() {
+            x86_self_locate(e, cfg.handler_base, FixupKind::HandlerTable);
+        });
+
+        init_steps.push_back([&]() {
+            x86_self_locate(e, cfg.ip, FixupKind::Bytecode);
+        });
+
+        // VM_RSP + exit_handler seed 
+        init_steps.push_back([&]() {
             const std::uint32_t hr_raw = vm_.vm_sp_headroom();
             const std::uint32_t hr = (hr_raw + 15u) & ~15u;
             e.mov_reg_reg(rx::rax, cfg.state_ptr, true);
             e.sub_reg_imm32(rx::rax, static_cast<std::int32_t>(4u + hr), true);
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.regs_base + vm_.slot_of_xreg(XReg::SP) * 8),
+                rx::rax,
+                true
+            );
+            write_zero_dword(static_cast<std::int32_t>(st.regs_base + vm_.slot_of_xreg(XReg::SP) * 8 + 4));
+            x86_self_locate(e, rx::rcx, FixupKind::VMExit);
+            e.mov_mem_reg(rx::rax, 0, rx::rcx, true);
+        });
+
+        // saved_native_rsp lo + hi
+        init_steps.push_back([&]() {
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.saved_native_rsp),
+                rx::rsp,
+                true
+            );
+            write_zero_dword(static_cast<std::int32_t>(st.saved_native_rsp) + 4);
+        });
+
+        // call_sp lo + hi
+        init_steps.push_back([&]() {
+            write_zero_dword(static_cast<std::int32_t>(st.call_sp));
+            write_zero_dword(static_cast<std::int32_t>(st.call_sp) + 4);
+        });
+
+        for (std::size_t i = init_steps.size(); i > 1; --i) {
+            const std::size_t j = init_rng.pick(static_cast<std::uint32_t>(i));
+            std::swap(init_steps[i - 1], init_steps[j]);
         }
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.regs_base + vm_.slot_of_xreg(XReg::SP) * 8),
-            rx::rax,
-            true
-        );
 
-        e.xor_reg_reg(rx::rcx, rx::rcx, true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.regs_base + vm_.slot_of_xreg(XReg::SP) * 8 + 4),
-            rx::rcx,
-            true
-        );
-
-        // seed the bottom of the shadow stack with exit_handler
-        x86_self_locate(e, rx::rcx, FixupKind::VMExit);
-        e.mov_mem_reg(
-            rx::rax,
-            0,
-            rx::rcx,
-            true
-        );
-
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.saved_native_rsp),
-            rx::rsp,
-            true
-        );
-
-        e.xor_reg_reg(rx::rax, rx::rax, true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.saved_native_rsp) + 4,
-            rx::rax,
-            true
-        );
-
-        e.xor_reg_reg(rx::rax, rx::rax, true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.call_sp),
-            rx::rax,
-            true
-        );
-
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.call_sp) + 4,
-            rx::rax,
-            true
-        );
+        for (auto& step : init_steps) {
+            if (init_rng.pick(2)) e.poly_nop(init_rng);
+            step();
+        }
 
         // copy sbox_inv table from the embedded blob to cipher_extra+256, 256
         // bytes total
@@ -263,9 +558,13 @@ namespace mkpivm {
             e.mov_reg_imm32(cfg.scratch_a, static_cast<std::int32_t>(cinit32), true);
             e.mov_reg_reg(cfg.cipher_state, cfg.scratch_a, true);
 
+            // poly per-loop seeded by kind so the 3 decrypt loops differ.
+            SeedRng dl_rng(vm_.cipher_init_state() ^ 0xDEC0DECULL ^ static_cast<std::uint64_t>(kind));
+            if (dl_rng.pick(2)) e.poly_nop(dl_rng);
             auto lbl_loop = e.new_label();
             e.bind(lbl_loop);
             emit_fetch_byte_dec(e, vm_, cfg.scratch_a);
+            if (dl_rng.pick(2)) e.poly_nop(dl_rng);
             e.u8(0x88);
             e.emit_modrm_mem(
                 cfg.scratch_a & 7,
@@ -276,8 +575,10 @@ namespace mkpivm {
             );
 
             e.inc_reg(cfg.scratch_b, true);
+            if (dl_rng.pick(2)) e.poly_nop(dl_rng);
+
+            // dec sets ZF, no need for explicit test
             e.dec_reg(counter_reg, true);
-            e.test_reg_reg(counter_reg, counter_reg, true);
             e.jcc_label(cc::nz, lbl_loop);
         };
 
@@ -298,13 +599,19 @@ namespace mkpivm {
             e.jcc_label(cc::nz, lbl_skip_decrypts_x86);
         }
 
-        // data-region decrypt stays in the prologue for default/range mode
-        // because lifted VM LOAD/STORE need plaintext
+        // data-region decrypt 
         if (data_island_size > 0 && !vm_.pack_mode()) {
+            if (vm_.rx_mode()) {
+                emit_vprotect_call_x86(e, vm_, kPageReadWrite_x86);
+            }
             emit_decrypt_loop_x86(FixupKind::DataIsland, static_cast<std::uint32_t>(data_island_size));
+            if (vm_.rx_mode()) {
+                emit_vprotect_call_x86(e, vm_, kPageExecuteRead_x86);
+            }
         }
 
-        if (block_table_count > 0) {
+        // block-table decrypt 
+        if (block_table_count > 0 && !vm_.rx_mode()) {
             emit_decrypt_loop_x86(FixupKind::BlockTable, block_table_count * 8);
         }
 
@@ -343,62 +650,33 @@ namespace mkpivm {
             );
 
             // dump lo+hi dword into the blob slot so entry 2+ can recover
-            // the nonce. per-entry VMState lives on stack and dies between
-            // entries, same retarded story as x64. order matters: self_locate
-            // FIRST since its `pop reg` clobbers the destination, and any
-            // prior `mov rax, [state_ptr+...]` load would be lost if
-            // scratch_b == rax for this seed. then carry the value via
-            // scratch_a
-            x86_self_locate(e, cfg.scratch_b, FixupKind::RuntimeNonce);
-            e.mov_reg_mem(
-                cfg.scratch_a,
-                cfg.state_ptr,
-                static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86,
-                true
-            );
-            e.mov_mem_reg(cfg.scratch_b, 0, cfg.scratch_a, true);
-            e.mov_reg_mem(
-                cfg.scratch_a,
-                cfg.state_ptr,
-                static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86 + 4,
-                true
-            );
-            e.mov_mem_reg(cfg.scratch_b, 4, cfg.scratch_a, true);
+            // the nonce
+            if (!vm_.rx_mode()) {
+                x86_self_locate(e, cfg.scratch_b, FixupKind::RuntimeNonce);
+                e.mov_reg_mem(
+                    cfg.scratch_a,
+                    cfg.state_ptr,
+                    static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86,
+                    true
+                );
+                e.mov_mem_reg(cfg.scratch_b, 0, cfg.scratch_a, true);
+                e.mov_reg_mem(
+                    cfg.scratch_a,
+                    cfg.state_ptr,
+                    static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86 + 4,
+                    true
+                );
+                e.mov_mem_reg(cfg.scratch_b, 4, cfg.scratch_a, true);
+            }
         }
 
-        emit_decrypt_loop_x86(FixupKind::HandlerTable, 256 * 4);
-
-        // post-decrypt
-        {
-            x86_self_locate(e, cfg.scratch_b, FixupKind::HandlerTable);
-            e.mov_reg_mem(
-                cfg.scratch_a,
-                cfg.state_ptr,
-                static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff_x86,
-                true
-            );
-
-            e.mov_reg_imm32(counter_reg, 256, true);
-            auto lbl_xor_loop = e.new_label();
-            e.bind(lbl_xor_loop);
-
-            // xor dword [scratch_b], scratch_a
-            e.u8(0x31);
-            e.emit_modrm_mem(
-                cfg.scratch_a & 7,
-                cfg.scratch_b,
-                rx::none,
-                0,
-                0
-            );
-
-            e.add_reg_imm32(cfg.scratch_b, 4, true);
-            e.dec_reg(counter_reg, true);
-            e.test_reg_reg(counter_reg, counter_reg, true);
-            e.jcc_label(cc::nz, lbl_xor_loop);
+        // handler-table decrypt skipped in --rx mode
+        if (!vm_.rx_mode()) {
+            emit_decrypt_loop_x86(FixupKind::HandlerTable, 256 * 5);
         }
 
-        {
+        // flip init_flag
+        if (!vm_.rx_mode()) {
             x86_self_locate(e, cfg.scratch_a, FixupKind::InitFlag);
             e.u8(0xC6);
             e.emit_modrm_mem(
@@ -412,11 +690,7 @@ namespace mkpivm {
         }
         e.bind(lbl_skip_decrypts_x86);
 
-        // copy blob nonce into VMState slot, every entry, no exceptions.
-        // same shit as x64. without this entry 2 reads stack garbage and
-        // dispatch lookups go straight into the weeds. carry the loaded
-        // values via scratch_a so the load `mov reg, [scratch_b+...]`
-        // doesn't clobber scratch_b mid-sequence when scratch_b == rax.
+        // copy blob nonce into VMState slot, every entry
         {
             x86_self_locate(e, cfg.scratch_b, FixupKind::RuntimeNonce);
             e.mov_reg_mem(cfg.scratch_a, cfg.scratch_b, 0, true);
@@ -439,22 +713,23 @@ namespace mkpivm {
         // end of emit_state_init
         x86_self_locate(e, cfg.ip, FixupKind::Bytecode);
 
-        // data_island_base via self-locate, points at the now-plaintext bytes.
-        x86_self_locate(e, rx::rax, FixupKind::DataIsland);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.data_island_base),
-            rx::rax,
-            true
-        );
+        {
+            x86_self_locate(e, rx::rax, FixupKind::DataIsland);
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.data_island_base),
+                rx::rax,
+                true
+            );
 
-        e.xor_reg_reg(rx::rax, rx::rax, true);
-        e.mov_mem_reg(
-            cfg.state_ptr,
-            static_cast<std::int32_t>(st.data_island_base) + 4,
-            rx::rax,
-            true
-        );
+            e.xor_reg_reg(rx::rax, rx::rax, true);
+            e.mov_mem_reg(
+                cfg.state_ptr,
+                static_cast<std::int32_t>(st.data_island_base) + 4,
+                rx::rax,
+                true
+            );
+        }
 
         x86_self_locate(e, rx::rax, FixupKind::BlockTable);
         e.mov_mem_reg(
@@ -694,8 +969,8 @@ namespace mkpivm {
     }
 
     void VMCodeGen::emit_trampoline(X86Emitter& e, std::uint32_t bytecode_offset) {
-        const auto& cfg = vm_.dispatcher_regs();
-        const auto& st  = vm_.state_layout();
+        const auto& cfg                       = vm_.dispatcher_regs();
+        const auto& st                        = vm_.state_layout();
         constexpr std::int32_t kCipherInitOff = 48;
         constexpr std::int32_t kSavedHbOff    = 24;
         constexpr std::int32_t kSavedCsOff    = 32;
@@ -841,10 +1116,11 @@ namespace mkpivm {
             emit_dispatch_tail(e, vm_);
         }
 
+        // handler dispatch table 
         off_.handler_table = e.size();
         off_.handler_offsets.assign(256, static_cast<std::size_t>(-1));
 
-        for (int i = 0; i < 256; ++i) e.u32(0);
+        for (int i = 0; i < 256 * 5; ++i) e.u8(0);
 
         // 1-byte init-done flag
         off_.init_flag = e.size();

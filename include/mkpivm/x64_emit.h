@@ -237,18 +237,30 @@ namespace mkpivm {
             void nop();
             void int3();
 
-            // semantically null NOP, length and content picked by the RNG
+            // semantically null NOP 
             template <typename Rng>
             void poly_nop(Rng& rng) {
-                switch (rng.pick(8)) {
-                    case 0:  bytes({0x90});                                           break; // nop
-                    case 1:  bytes({0x66, 0x90});                                     break; // 66 90
-                    case 2:  bytes({0x0F, 0x1F, 0x00});                               break; // 3-byte nopl
-                    case 3:  bytes({0x0F, 0x1F, 0x40, 0x00});                         break; // 4-byte nopl
-                    case 4:  bytes({0x0F, 0x1F, 0x44, 0x00, 0x00});                   break; // 5-byte nopl
-                    case 5:  bytes({0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00});             break;
-                    case 6:  bytes({0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00});       break;
-                    default: bytes({0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00}); break;
+                switch (rng.pick(20)) {
+                    case 0:  bytes({0x90});                         break; // nop
+                    case 1:  bytes({0x66, 0x90});                   break; // 66 90
+                    case 2:  bytes({0x0F, 0x1F, 0x00});             break; // 3-byte nopl
+                    case 3:  bytes({0x0F, 0x1F, 0x40, 0x00});       break; // 4-byte nopl
+                    case 4:  bytes({0x0F, 0x1F, 0x44, 0x00, 0x00}); break; // 5-byte nopl
+                    case 5:  bytes({0x48, 0x89, 0xC0});             break; // mov rax, rax (89)
+                    case 6:  bytes({0x48, 0x89, 0xC9});             break; // mov rcx, rcx (89)
+                    case 7:  bytes({0x48, 0x89, 0xD2});             break; // mov rdx, rdx (89)
+                    case 8:  bytes({0x48, 0x8B, 0xC0});             break; // mov rax, rax (8B)
+                    case 9:  bytes({0x48, 0x8B, 0xC9});             break; // mov rcx, rcx (8B)
+                    case 10: bytes({0x48, 0x8B, 0xD2});             break; // mov rdx, rdx (8B)
+                    case 11: bytes({0x4D, 0x89, 0xC0});             break; // mov r8, r8
+                    case 12: bytes({0x4D, 0x89, 0xC9});             break; // mov r9, r9
+                    case 13: bytes({0x4D, 0x8B, 0xC0});             break; // mov r8, r8 (8B)
+                    case 14: bytes({0x4D, 0x8B, 0xD2});             break; // mov r10, r10
+                    case 15: bytes({0x48, 0x8D, 0x00});             break; // lea rax, [rax]
+                    case 16: bytes({0x48, 0x8D, 0x09});             break; // lea rcx, [rcx]
+                    case 17: bytes({0x48, 0x8D, 0x12});             break; // lea rdx, [rdx]
+                    case 18: bytes({0x48, 0x8D, 0x40, 0x00});       break; // lea rax, [rax+0]
+                    default: bytes({0x48, 0x8D, 0x49, 0x00});       break; // lea rcx, [rcx+0]
                 }
             }
 

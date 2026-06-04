@@ -195,15 +195,27 @@ namespace mkpivm {
             void nop();
             void int3();
 
+            // semantic-nop pool. mix of short 0F 1F nops, mov reg,reg in 89
+            // and 8B encodings, and lea reg,[reg]. dropped the longer 0F 1F
+            // forms which fingerprinted across samples. all preserve flags.
             template <typename Rng>
             void poly_nop(Rng& rng) {
-                switch (rng.pick(6)) {
-                    case 0:  bytes({0x90}); break;             // nop
-                    case 1:  bytes({0x66, 0x90}); break;       // 66 nop
-                    case 2:  bytes({0x8B, 0xC0}); break;       // mov eax, eax
-                    case 3:  bytes({0x8B, 0xC9}); break;       // mov ecx, ecx
-                    case 4:  bytes({0x8B, 0xD2}); break;       // mov edx, edx
-                    default: bytes({0x0F, 0x1F, 0x00}); break; // 3-byte nopl
+                switch (rng.pick(15)) {
+                    case 0:  bytes({0x90});                   break; // nop
+                    case 1:  bytes({0x66, 0x90});             break; // 66 nop
+                    case 2:  bytes({0x8B, 0xC0});             break; // mov eax, eax (8B)
+                    case 3:  bytes({0x8B, 0xC9});             break; // mov ecx, ecx (8B)
+                    case 4:  bytes({0x8B, 0xD2});             break; // mov edx, edx (8B)
+                    case 5:  bytes({0x89, 0xC0});             break; // mov eax, eax (89)
+                    case 6:  bytes({0x89, 0xC9});             break; // mov ecx, ecx (89)
+                    case 7:  bytes({0x89, 0xD2});             break; // mov edx, edx (89)
+                    case 8:  bytes({0x0F, 0x1F, 0x00});       break; // 3-byte nopl
+                    case 9:  bytes({0x0F, 0x1F, 0x40, 0x00}); break; // 4-byte nopl
+                    case 10: bytes({0x8D, 0x00});             break; // lea eax, [eax]
+                    case 11: bytes({0x8D, 0x09});             break; // lea ecx, [ecx]
+                    case 12: bytes({0x8D, 0x12});             break; // lea edx, [edx]
+                    case 13: bytes({0x8D, 0x40, 0x00});       break; // lea eax, [eax+0]
+                    default: bytes({0x8D, 0x49, 0x00});       break; // lea ecx, [ecx+0]
                 }
             }
 

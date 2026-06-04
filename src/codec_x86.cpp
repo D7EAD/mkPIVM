@@ -61,8 +61,52 @@ namespace mkpivm {
         }
     }
 
+    // cmp r32, imm8 form. 3 bytes vs 6 for cmp_reg_imm32 
+    static void emit_cmp_reg_imm8_x86(X86Emitter& e, std::uint8_t dst, std::int8_t imm) {
+        e.u8(0x83);
+        e.emit_modrm(3, 7, dst & 7);
+        e.u8(static_cast<std::uint8_t>(imm));
+    }
+
+    // pick the cmp encoding per seed. both produce identical flags.
+    static void emit_cmp_reg_imm_poly_x86(X86Emitter& e, SeedRng& rng, std::uint8_t dst, std::int32_t imm) {
+        const bool fits_i8 = imm >= -128 && imm <= 127;
+        if (fits_i8 && rng.pick(2)) {
+            emit_cmp_reg_imm8_x86(e, dst, static_cast<std::int8_t>(imm));
+        }
+        else {
+            e.cmp_reg_imm32(dst, imm, true);
+        }
+    }
+
+    // bt r32, imm8. 4 bytes. tests bit `bit` of dst, sets CF.
+    static void emit_bt_reg_imm8_x86(X86Emitter& e, std::uint8_t dst, std::uint8_t bit) {
+        if (dst >= 8) throw Error("emit_bt_reg_imm8_x86: no r8+");
+        e.u8(0x0F); e.u8(0xBA);
+        e.emit_modrm(3, 4, dst & 7); // /4 = bt subop
+        e.u8(bit);
+    }
+
+    static constexpr std::uint8_t log2_pow2_x86(int v) {
+        return v == 1 ? 0 : v == 2 ? 1 : v == 4 ? 2 : v == 8 ? 3 :
+               v == 16 ? 4 : v == 32 ? 5 : v == 64 ? 6 : 7;
+    }
+
+    // emit "if reg == w branch target" in cmp+jz or bt+jc form 
+    static void emit_width_test_poly_x86(X86Emitter& e, SeedRng& rng, std::uint8_t reg, int w, X86Emitter::LabelId target) {
+        const bool is_pow2 = w > 0 && (w & (w - 1)) == 0;
+        if (is_pow2 && rng.pick(2)) {
+            emit_bt_reg_imm8_x86(e, reg, log2_pow2_x86(w));
+            e.jcc_label(cc::b, target);
+        }
+        else {
+            emit_cmp_reg_imm_poly_x86(e, rng, reg, w);
+            e.jcc_label(cc::z, target);
+        }
+    }
+
     // pick the volatile of eax/ecx/edx that is neither scratch_a nor
-    // scratch_b 
+    // scratch_b
     static std::uint8_t third_volatile(const DispatcherRegs& r) {
         for (auto v : {rx::rax, rx::rcx, rx::rdx}) {
             if (v != r.scratch_a && v != r.scratch_b) return v;
@@ -166,13 +210,18 @@ namespace mkpivm {
         // accumulate N little-endian bytes into dst 
         const auto& r = vm.dispatcher_regs();
         const std::uint8_t inner = (dst == r.scratch_b) ? r.scratch_a : r.scratch_b;
+        SeedRng rng_fu(vm.cipher_k1() ^ 0xFE7C1117ULL ^ (static_cast<std::uint64_t>(n) << 8) ^ dst);
         e.push_reg(inner);
         e.xor_reg_reg(dst, dst, true);
         if (n > 0) {
             emit_fetch_byte_dec(e, vm, dst);
             for (std::uint8_t i = 1; i < n; ++i) {
                 emit_fetch_byte_dec(e, vm, inner);
+                e.poly_nop(rng_fu);
+                if (rng_fu.pick(2)) e.poly_nop(rng_fu);
                 e.shl_reg_imm8(inner, static_cast<std::uint8_t>(8 * i), true);
+                e.poly_nop(rng_fu);
+                if (rng_fu.pick(3) == 0) e.poly_nop(rng_fu);
                 e.or_reg_reg(dst, inner, true);
             }
         }
@@ -191,35 +240,27 @@ namespace mkpivm {
     // dispatcher tail for 32-bit 
     void emit_dispatch_tail(X86Emitter& e, const VMConfig& vm) {
         const auto& r = vm.dispatcher_regs();
-        const auto& st = vm.state_layout();
-        constexpr std::int32_t kRuntimeNonceOff = 80;
+        (void)vm;
         emit_fetch_byte_dec(e, vm, r.scratch_a);
 
-        // mov scratch_b, dword [handler_base + scratch_a*4]
-        e.u8(0x8B);
-        e.emit_modrm(2, r.scratch_b & 7, 4); // SIB follows, disp32
-        e.emit_sib(2, r.scratch_a & 7, r.handler_base & 7);
-        e.u32(0); // disp32 = 0
-
-        // xor with runtime nonce to undo the per-process xor layer
-        // emit_state_init applied to the in-memory handler table.
-        e.u8(0x33);
-        e.emit_modrm_mem(
-            r.scratch_b & 7,
-            r.state_ptr,
-            rx::none,
-            0,
-            static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff
+        // scratch_a = scratch_a * 5 via lea [scratch_a + scratch_a*4]
+        e.lea_reg_mem(
+            r.scratch_a,
+            r.scratch_a,
+            r.scratch_a,
+            2,
+            0
         );
 
-        // lea scratch_a, [handler_base + scratch_b]
+        // scratch_a = handler_base + scratch_a 
         e.lea_reg_mem(
             r.scratch_a,
             r.handler_base,
-            r.scratch_b,
+            r.scratch_a,
             0,
             0
         );
+
         e.jmp_reg(r.scratch_a);
     }
 
@@ -241,56 +282,106 @@ namespace mkpivm {
 
     // mask reg to width_reg's width using low 7 bits, for imm and non-reg
     // operands 
-    static void emit_mask_to_width_x86(X86Emitter& e, const VMConfig&, std::uint8_t reg, std::uint8_t width_reg) {
-        auto lbl_w4 = e.new_label(), lbl_w2 = e.new_label(), lbl_done = e.new_label();
+    static void emit_mask_to_width_x86(X86Emitter& e, const VMConfig& vm, std::uint8_t reg, std::uint8_t width_reg,
+                                       std::uint64_t call_salt = 0) {
+        SeedRng rng(vm.cipher_k1() ^ 0xA5751717ULL ^ call_salt ^ 0x511177BCULL);
 
-        e.push_reg(width_reg);
-        e.and_reg_imm32(width_reg, 0x7F, true);
-        e.cmp_reg_imm32(width_reg, 4, true);
-        e.pop_reg(width_reg);
-        e.jcc_label(cc::z, lbl_w4);
-        e.push_reg(width_reg);
-        e.and_reg_imm32(width_reg, 0x7F, true);
-        e.cmp_reg_imm32(width_reg, 2, true);
-        e.pop_reg(width_reg);
-        e.jcc_label(cc::z, lbl_w2);
+        // width 4 is no-op on 32-bit, just falls through to lbl_done
+        std::array<int, 3> widths{1, 2, 4};
+        shuffle_in_place(widths, rng);
+        std::array<int, 2> body_order{widths[0], widths[1]};
+        shuffle_in_place(body_order, rng);
 
-        e.and_reg_imm32(reg, 0xFF, true);
+        auto lbl_w1 = e.new_label(), lbl_w2 = e.new_label(), lbl_w4 = e.new_label();
+        auto lbl_done = e.new_label();
+
+        auto label_of = [&](int w) {
+            switch (w) {
+                case 1:  return lbl_w1;
+                case 2:  return lbl_w2;
+                default: return lbl_w4;
+            }
+        };
+
+        auto emit_body = [&](int w) {
+            const bool use_movzx = (rng.pick(2) == 0);
+            switch (w) {
+                case 1:
+                    if (use_movzx) e.movzx_r32_r8(reg, reg);
+                    else           e.and_reg_imm32(reg, 0xFF, true);
+                    break;
+                case 2:
+                    if (use_movzx) e.movzx_r32_r16(reg, reg);
+                    else           e.and_reg_imm32(reg, 0xFFFF, true);
+                    break;
+                case 4: break;
+            }
+        };
+
+        for (int w : {widths[0], widths[1]}) {
+            if (rng.pick(2)) e.poly_nop(rng);
+            const bool is_pow2 = w > 0 && (w & (w - 1)) == 0;
+            if (is_pow2 && rng.pick(2)) {
+                // bt directly tests the bit no mask needed
+                emit_bt_reg_imm8_x86(e, width_reg, log2_pow2_x86(w));
+                e.jcc_label(cc::b, label_of(w));
+            }
+            else {
+                e.push_reg(width_reg);
+                e.and_reg_imm32(width_reg, 0x7F, true);
+                emit_cmp_reg_imm_poly_x86(e, rng, width_reg, w);
+                e.pop_reg(width_reg);
+                e.jcc_label(cc::z, label_of(w));
+            }
+        }
+
+        if (rng.pick(2)) e.poly_nop(rng);
+        emit_body(widths[2]);
         e.jmp_label(lbl_done);
-        e.bind(lbl_w2);
-        e.and_reg_imm32(reg, 0xFFFF, true);
-        e.jmp_label(lbl_done);
-        e.bind(lbl_w4);
 
-        // width 4, or 8 which we treat as 4 on x86. already 32-bit, no-op.
+        for (std::size_t i = 0; i < body_order.size(); ++i) {
+            const int w = body_order[i];
+            e.bind(label_of(w));
+            if (rng.pick(2)) e.poly_nop(rng);
+            emit_body(w);
+            if (i + 1 != body_order.size()) e.jmp_label(lbl_done);
+        }
+
         e.bind(lbl_done);
     }
 
     // extract a register-operand value, honoring the high-byte flag in bit 7
-    // of width_reg. high-byte case ah/ch/dh/bh shifts right 8 first.
-    static void emit_extract_operand_x86(X86Emitter& e, const VMConfig& vm, std::uint8_t reg, std::uint8_t width_reg) {
+    // of width_reg 
+    static void emit_extract_operand_x86(X86Emitter& e, const VMConfig& vm, std::uint8_t reg, std::uint8_t width_reg,
+                                         std::uint64_t call_salt = 0) {
+        SeedRng rng(vm.cipher_k1() ^ 0xE107AC7117ULL ^ 0x6B91CC03ULL ^ call_salt);
         auto lbl_no_hi = e.new_label();
 
+        // and width_reg, 0x80 already sets ZF, and pop preserves flags 
         e.push_reg(width_reg);
         e.and_reg_imm32(width_reg, 0x80, true);
-        e.cmp_reg_imm32(width_reg, 0, true);
+        if (rng.pick(2)) e.poly_nop(rng);
+        if (rng.pick(2) == 0) {
+            e.cmp_reg_imm32(width_reg, 0, true);
+        }
         e.pop_reg(width_reg);
+        if (rng.pick(2)) e.poly_nop(rng);
         e.jcc_label(cc::z, lbl_no_hi);
         e.shr_reg_imm8(reg, 8, true);
         e.bind(lbl_no_hi);
+        if (rng.pick(2)) e.poly_nop(rng);
         emit_mask_to_width_x86(
             e,
             vm,
             reg,
-            width_reg
+            width_reg,
+            call_salt ^ 0x1B7C7E5DULL
         );
     }
 
     // store value_reg into VMState slot at slot_idx_reg, honoring width 
-    static void emit_store_slot_value_x86(X86Emitter& e, const VMConfig& vm,
-                                          std::uint8_t slot_idx_reg,
-                                          std::uint8_t value_reg,
-                                          std::uint8_t width_reg) {
+    static void emit_store_slot_value_x86(X86Emitter& e, const VMConfig& vm, std::uint8_t slot_idx_reg,
+                                          std::uint8_t value_reg, std::uint8_t width_reg) {
         const auto& r = vm.dispatcher_regs();
         const auto regs_base = static_cast<std::int32_t>(vm.state_layout().regs_base);
 
@@ -362,7 +453,7 @@ namespace mkpivm {
         e.bind(lbl_done);
     }
 
-    // polymorphic NOP filler.
+    // polymorphic NOP filler
     void emit_junk(X86Emitter& e, const VMConfig& vm, SeedRng& rng) {
         const std::uint8_t density = vm.junk_density();
         const std::uint32_t n = 1u + (density ? rng.pick(2u + density) : 0u);
@@ -420,17 +511,23 @@ namespace mkpivm {
             e,
             vm,
             valreg,
-            r.scratch_b
+            r.scratch_b,
+            (static_cast<std::uint64_t>(op) << 16) ^ 0xA01ULL
         );
 
         emit_fetch_byte_dec(e, vm, r.scratch_a); // tag
         auto lbl_imm = e.new_label();
         auto lbl_mem = e.new_label();
         auto lbl_have_op1 = e.new_label();
-        e.cmp_reg_imm32(r.scratch_a, 1, true);
-        e.jcc_label(cc::z, lbl_imm);
-        e.cmp_reg_imm32(r.scratch_a, 2, true);
-        e.jcc_label(cc::z, lbl_mem);
+        {
+            SeedRng rng_tag(vm.cipher_k1() ^ 0x7A6D15FA7CULL ^ (static_cast<std::uint64_t>(op) << 4) ^
+                            static_cast<std::uint64_t>(fkind));
+            if (rng_tag.pick(2)) e.poly_nop(rng_tag);
+            emit_width_test_poly_x86(e, rng_tag, r.scratch_a, 1, lbl_imm);
+            if (rng_tag.pick(2)) e.poly_nop(rng_tag);
+            emit_width_test_poly_x86(e, rng_tag, r.scratch_a, 2, lbl_mem);
+            if (rng_tag.pick(2)) e.poly_nop(rng_tag);
+        }
 
         // tag=0 reg: fetch op1 slot+width, SIB-load, extract.
         emit_fetch_byte_dec(e, vm, r.scratch_a);
@@ -448,7 +545,8 @@ namespace mkpivm {
             e,
             vm,
             r.scratch_a,
-            r.scratch_b
+            r.scratch_b,
+            (static_cast<std::uint64_t>(op) << 16) ^ 0xB02ULL
         );
         e.jmp_label(lbl_have_op1);
 
@@ -479,14 +577,14 @@ namespace mkpivm {
             e,
             vm,
             r.scratch_a,
-            r.scratch_b
+            r.scratch_b,
+            (static_cast<std::uint64_t>(op) << 12) ^ 0xC03ULL
         );
         e.jmp_label(lbl_have_op1);
 
         e.bind(lbl_mem);
 
-        // mem source. emit_x86_mem_addr clobbers valreg which currently holds
-        // op0, so save it across the call.
+        // mem source 
         e.push_reg(valreg);
         emit_x86_mem_addr(e, vm, valreg);
         e.add_reg_imm32(rx::rsp, 8, true); // drop seg + width
@@ -509,25 +607,29 @@ namespace mkpivm {
             e,
             vm,
             r.scratch_a,
-            r.scratch_b
+            r.scratch_b,
+            (static_cast<std::uint64_t>(op) << 12) ^ 0xD04ULL
         );
 
         e.bind(lbl_have_op1);
 
-        // valreg = extracted dst, scratch_a = extracted op1.
-        // save flag context: A = dst, B = op1.
-        e.mov_mem_reg(
-            r.state_ptr,
-            static_cast<std::int32_t>(st.flags_a),
-            valreg,
-            true
-        );
-        e.mov_mem_reg(
-            r.state_ptr,
-            static_cast<std::int32_t>(st.flags_b),
-            r.scratch_a,
-            true
-        );
+        // valreg = extracted dst, scratch_a = extracted op1 
+        {
+            SeedRng rng_fc(vm.cipher_k1() ^ 0xBA1C0DE5ULL ^ (static_cast<std::uint64_t>(op) << 8) ^
+                           static_cast<std::uint64_t>(fkind));
+            const bool a_first = (rng_fc.pick(2) == 0);
+            if (a_first) {
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(st.flags_a), valreg, true);
+                if (rng_fc.pick(2)) e.poly_nop(rng_fc);
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(st.flags_b), r.scratch_a, true);
+            }
+            else {
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(st.flags_b), r.scratch_a, true);
+                if (rng_fc.pick(2)) e.poly_nop(rng_fc);
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(st.flags_a), valreg, true);
+            }
+            if (rng_fc.pick(2)) e.poly_nop(rng_fc);
+        }
 
         // ALU op into valreg.
         switch (op) {
@@ -547,7 +649,8 @@ namespace mkpivm {
             e,
             vm,
             valreg,
-            r.scratch_b
+            r.scratch_b,
+            (static_cast<std::uint64_t>(op) << 8) ^ 0xE05ULL
         );
 
         // save flag_result. valreg still holds the result for storeback.
@@ -1068,7 +1171,7 @@ namespace mkpivm {
         const std::uint8_t si_slot = vm.slot_of_xreg(XReg::SI);
         const std::uint8_t di_slot = vm.slot_of_xreg(XReg::DI);
 
-        // byte [VM_DI] ← byte [VM_SI]; both ++.
+        // byte [VM_DI] ← byte [VM_SI]; both inc
         e.mov_reg_mem(
             r.scratch_a,
             r.state_ptr,
@@ -1136,8 +1239,7 @@ namespace mkpivm {
         e.push_reg(r.scratch_a);                 // dst slot
         e.push_reg(r.scratch_b);                 // dst width
 
-        // compute addr into valreg. after this, stack from top
-        // [esp+0]=seg, [esp+4]=mem_width, then dst_width, dst_slot.
+        // compute addr into valreg 
         emit_x86_mem_addr(e, vm, valreg);
 
         // branch on seg 0 default, 1 fs, 2 gs. non-default needs a seg prefix
@@ -1280,8 +1382,7 @@ namespace mkpivm {
     }
 
     // INC / DEC reg: single-operand arith, sets flags but not CF.
-    static void emit_unary_arith_x86(X86Emitter& e, const VMConfig& vm,
-                                     FlagsOp fkind,
+    static void emit_unary_arith_x86(X86Emitter& e, const VMConfig& vm, FlagsOp fkind,
                                      void (X86Emitter::*op_reg)(std::uint8_t, bool)) {
         const auto& r = vm.dispatcher_regs();
         const auto regs_base = static_cast<std::int32_t>(vm.state_layout().regs_base);
@@ -1304,7 +1405,8 @@ namespace mkpivm {
             e,
             vm,
             valreg,
-            r.scratch_b
+            r.scratch_b,
+            0xC1A1FULL ^ static_cast<std::uint64_t>(fkind)
         );
 
         // save flag_a = pre-op value.
@@ -1323,7 +1425,8 @@ namespace mkpivm {
             e,
             vm,
             valreg,
-            r.scratch_b
+            r.scratch_b,
+            0xCA2BFULL ^ static_cast<std::uint64_t>(fkind)
         );
         e.mov_mem_reg(
             r.state_ptr,
@@ -1399,11 +1502,18 @@ namespace mkpivm {
         const auto& st = vm.state_layout();
         const std::uint8_t valreg = third_volatile(r);
 
-        // op0: tag 1B, reg path slot+width, imm path 8 bytes.
+        // op0: tag 1B, reg path slot+width, imm path 8 bytes 
+        SeedRng rng_ct(vm.cipher_k1() ^ 0xC714857ULL ^ (is_test ? 1ULL : 0ULL));
         emit_fetch_byte_dec(e, vm, r.scratch_a); // op0 tag
         auto lbl_op0_imm = e.new_label();
         auto lbl_op0_done = e.new_label();
-        e.cmp_reg_imm32(r.scratch_a, 0, true);
+        if (rng_ct.pick(2)) e.poly_nop(rng_ct);
+        if (rng_ct.pick(2)) {
+            e.test_reg_reg(r.scratch_a, r.scratch_a, true);
+        }
+        else {
+            e.cmp_reg_imm32(r.scratch_a, 0, true);
+        }
         e.jcc_label(cc::nz, lbl_op0_imm);
 
         // op0 reg
@@ -1421,7 +1531,8 @@ namespace mkpivm {
             e,
             vm,
             valreg,
-            r.scratch_b
+            r.scratch_b,
+            0xC470F0ULL ^ (is_test ? 1ULL : 0ULL)
         );
         e.jmp_label(lbl_op0_done);
         e.bind(lbl_op0_imm);
@@ -1443,16 +1554,17 @@ namespace mkpivm {
         // save op0 on stack.
         e.push_reg(valreg);
 
-        // op1: tag, reg/imm/mem.
+        // op1: tag, reg/imm/mem. same poly treatment as op0.
         emit_fetch_byte_dec(e, vm, r.scratch_a); // op1 tag
 
         auto lbl_op1_imm = e.new_label();
         auto lbl_op1_mem = e.new_label();
         auto lbl_op1_done = e.new_label();
-        e.cmp_reg_imm32(r.scratch_a, 1, true);
-        e.jcc_label(cc::z, lbl_op1_imm);
-        e.cmp_reg_imm32(r.scratch_a, 2, true);
-        e.jcc_label(cc::z, lbl_op1_mem);
+        if (rng_ct.pick(2)) e.poly_nop(rng_ct);
+        emit_width_test_poly_x86(e, rng_ct, r.scratch_a, 1, lbl_op1_imm);
+        if (rng_ct.pick(2)) e.poly_nop(rng_ct);
+        emit_width_test_poly_x86(e, rng_ct, r.scratch_a, 2, lbl_op1_mem);
+        if (rng_ct.pick(2)) e.poly_nop(rng_ct);
 
         // op1 reg
         emit_fetch_byte_dec(e, vm, r.scratch_a);
@@ -1469,7 +1581,8 @@ namespace mkpivm {
             e,
             vm,
             valreg,
-            r.scratch_b
+            r.scratch_b,
+            0xC471F1ULL ^ (is_test ? 1ULL : 0ULL)
         );
         e.jmp_label(lbl_op1_done);
         e.bind(lbl_op1_imm);
@@ -1510,13 +1623,15 @@ namespace mkpivm {
             e,
             vm,
             r.scratch_a,
-            r.scratch_b
+            r.scratch_b,
+            0xC472F2ULL ^ (is_test ? 1ULL : 0ULL)
         );
         emit_mask_to_width_x86(
             e,
             vm,
             valreg,
-            r.scratch_b
+            r.scratch_b,
+            0xC473F3ULL ^ (is_test ? 1ULL : 0ULL)
         );
 
         // save flags_a = op0, flags_b = op1.
@@ -1542,7 +1657,8 @@ namespace mkpivm {
             e,
             vm,
             r.scratch_a,
-            r.scratch_b
+            r.scratch_b,
+            0xC474F4ULL ^ (is_test ? 1ULL : 0ULL)
         );
         e.mov_mem_reg(
             r.state_ptr,
@@ -1895,6 +2011,8 @@ namespace mkpivm {
     static void emit_native_handler_x86(X86Emitter& e, const VMConfig& vm, bool is_jmp) {
         const auto& r = vm.dispatcher_regs();
         const auto& st = vm.state_layout();
+        // --rx 
+        if (vm.rx_mode()) goto skip_deferred_x86;
         {
             // deferred data-island decrypt
             auto lbl_done = e.new_label();
@@ -1982,6 +2100,7 @@ namespace mkpivm {
 
             e.bind(lbl_done);
         }
+        skip_deferred_x86:
         const auto regs_base = static_cast<std::int32_t>(st.regs_base);
         const std::uint8_t valreg = third_volatile(r);
         const std::int32_t sp_off = regs_base + vm.slot_of_xreg(XReg::SP) * 8;
@@ -2191,9 +2310,7 @@ namespace mkpivm {
                 true
             );
 
-            // --range-leak-nvs, opt-in. blast lifted NV slot values over
-            // the prologue saves so exit_handler's pops pick them up.
-            // same dumb story as the x64 sibling.
+            // --range-leak-nvs 
             if (vm.range_leak_nvs()) if (const auto* order = prologue_order_for(e)) {
                 auto host_to_xreg = [](std::uint8_t reg) -> XReg {
                     if (reg == rx::rbx) return XReg::BX;
@@ -2506,12 +2623,12 @@ namespace mkpivm {
         e.bind(lbl_w1);
 
         if (is_signed) e.movsx_r32_r8(valreg, valreg);
-        else           e.movzx_r32_r8(valreg, valreg);
+        else e.movzx_r32_r8(valreg, valreg);
         e.jmp_label(lbl_done);
         e.bind(lbl_w2);
 
         if (is_signed) e.movsx_r32_r16(valreg, valreg);
-        else           e.movzx_r32_r16(valreg, valreg);
+        else e.movzx_r32_r16(valreg, valreg);
         e.bind(lbl_done);
 
         e.pop_reg(r.scratch_b);
@@ -3259,13 +3376,15 @@ namespace mkpivm {
 
         const std::int32_t comp_base = static_cast<std::int32_t>(vm.state_layout().cipher_extra) + 128;
 
-        // valreg = b_lo
+        // valreg = b_lo. xor c, add a, sub d for the obfuscated imm decode 
+        SeedRng rng_imm(vm.cipher_k1() ^ 0x1ABBED1E7ULL);
         e.mov_reg_mem(
             valreg,
             r.state_ptr,
             comp_base + 4,
             true
         );
+        if (rng_imm.pick(2)) e.poly_nop(rng_imm);
 
         // xor valreg, [state_ptr + comp_base+8], c_lo
         e.u8(0x33);
@@ -3276,6 +3395,7 @@ namespace mkpivm {
             0,
             comp_base + 8
         );
+        if (rng_imm.pick(2)) e.poly_nop(rng_imm);
 
         // add valreg, [state_ptr + comp_base+0], a_lo
         e.u8(0x03);
@@ -3286,6 +3406,7 @@ namespace mkpivm {
             0,
             comp_base + 0
         );
+        if (rng_imm.pick(2)) e.poly_nop(rng_imm);
 
         // sub valreg, [state_ptr + comp_base+12], d_lo
         e.u8(0x2B);

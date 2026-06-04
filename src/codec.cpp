@@ -2,6 +2,7 @@
 #include "mkpivm/vm_codegen.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace mkpivm {
     static std::uint8_t slot_for(const VMConfig& vm, XReg r) {
@@ -238,15 +239,23 @@ namespace mkpivm {
     }
 
     void emit_fetch_uN_dec(X64Emitter& e, const VMConfig& vm, std::uint8_t dst, std::uint8_t n) {
-        // assemble N little-endian bytes into dst 
-        (void)vm;
+        // assemble N little-endian bytes into dst. nop-sprinkle per iteration
+        // so the tail of a multi-byte fetch doesn't end up with the same
+        // shl r11, K / or dst, r11 fingerprint across samples.
+        SeedRng rng_fu(vm.cipher_k1() ^ 0xFE7C1117ULL ^ (static_cast<std::uint64_t>(n) << 8) ^ dst);
         e.xor_reg_reg(dst, dst);
         if (n == 0) return;
         emit_fetch_byte_dec(e, vm, dst);
 
         for (std::uint8_t i = 1; i < n; ++i) {
             emit_fetch_byte_dec(e, vm, rx::r11);
+            // always emit at least one poly_nop before the shift to guarantee
+            // some byte variation per iteration tail.
+            e.poly_nop(rng_fu);
+            if (rng_fu.pick(2)) e.poly_nop(rng_fu);
             e.shl_reg_imm8(rx::r11, static_cast<std::uint8_t>(8 * i));
+            e.poly_nop(rng_fu);
+            if (rng_fu.pick(3) == 0) e.poly_nop(rng_fu);
             e.or_reg_reg(dst, rx::r11);
         }
     }
@@ -278,22 +287,64 @@ namespace mkpivm {
         return rx::rdx; // unreachable: pool > avoid
     }
 
-    // mask reg to width_reg's width, stripping the high-byte flag 
+    // cmp r64, imm8 form. 4 bytes vs 7 for cmp_reg_imm32
+    static void emit_cmp_reg_imm8(X64Emitter& e, std::uint8_t dst, std::int8_t imm) {
+        e.emit_rex(true, false, false, dst >= 8);
+        e.u8(0x83);
+        e.emit_modrm(3, 7, dst & 7);
+        e.u8(static_cast<std::uint8_t>(imm));
+    }
+
+    // pick the cmp encoding per seed call. both produce identical flags.
+    static void emit_cmp_reg_imm_poly(X64Emitter& e, SeedRng& rng, std::uint8_t dst, std::int32_t imm) {
+        const bool fits_i8 = imm >= -128 && imm <= 127;
+        if (fits_i8 && rng.pick(2)) {
+            emit_cmp_reg_imm8(e, dst, static_cast<std::int8_t>(imm));
+        }
+        else {
+            e.cmp_reg_imm32(dst, imm);
+        }
+    }
+
+    // bt r64, imm8. 5 bytes. tests bit `bit` of dst, sets CF accordingly.
+    static void emit_bt_reg_imm8(X64Emitter& e, std::uint8_t dst, std::uint8_t bit) {
+        e.emit_rex(true, false, false, dst >= 8);
+        e.u8(0x0F); e.u8(0xBA);
+        e.emit_modrm(3, 4, dst & 7);  // /4 = bt subop
+        e.u8(bit);
+    }
+
+    // log2 of a single-bit value. valid for {1, 2, 4, 8, ...}.
+    static constexpr std::uint8_t log2_pow2(int v) {
+        return v == 1 ? 0 : v == 2 ? 1 : v == 4 ? 2 : v == 8 ? 3 :
+               v == 16 ? 4 : v == 32 ? 5 : v == 64 ? 6 : 7;
+    }
+
+    static void emit_width_test_poly(X64Emitter& e, SeedRng& rng, std::uint8_t reg, int w, X64Emitter::LabelId target) {
+        const bool is_pow2 = w > 0 && (w & (w - 1)) == 0;
+        if (is_pow2 && rng.pick(2)) {
+            emit_bt_reg_imm8(e, reg, log2_pow2(w));
+            e.jcc_label(cc::b, target);
+        }
+        else {
+            emit_cmp_reg_imm_poly(e, rng, reg, w);
+            e.jcc_label(cc::z, target);
+        }
+    }
+
+    // mask reg to width_reg's width, stripping the high-byte flag
     static void emit_mask_to_width(X64Emitter& e, const VMConfig& vm,
                                    std::uint8_t reg, std::uint8_t width_reg,
                                    std::uint64_t call_salt = 0) {
-        // stack-save the shuffled temp 
         const std::uint8_t T = pick_temp_reg(vm, 0xA5751717ULL ^ call_salt, {reg, width_reg});
         e.push_reg(T);
         e.mov_reg_reg(T, width_reg);
         e.and_reg_imm32(T, 0x7F);
 
-        // permute cascade order and body layout per seed + call_salt
         SeedRng rng(vm.cipher_k1() ^ 0xA5751717ULL ^ call_salt ^ 0x511177BCULL);
         std::array<int, 4> widths{1, 2, 4, 8};
         shuffle_in_place(widths, rng);
 
-        // widths[0..2] are the three cascade tests, widths[3] is the inline default.
         std::array<int, 3> body_order{widths[0], widths[1], widths[2]};
         shuffle_in_place(body_order, rng);
 
@@ -302,7 +353,7 @@ namespace mkpivm {
         auto lbl_done = e.new_label();
 
         auto label_of = [&](int w) {
-            switch (w) { 
+            switch (w) {
                 case 1:  return lbl_w1;
                 case 2:  return lbl_w2;
                 case 4:  return lbl_w4;
@@ -310,28 +361,37 @@ namespace mkpivm {
             }
         };
 
+        // pick mask emit variant per body per seed. and-mask and movzx
+        // both keep low N bits but encode to different bytes.
         auto emit_body = [&](int w) {
+            const bool use_movzx = (rng.pick(2) == 0);
             switch (w) {
-                case 1: e.and_reg_imm32(reg, 0xFF);       break;
-                case 2: e.and_reg_imm32(reg, 0xFFFF);     break;
-                case 4: e.mov_reg_reg(reg, reg, false);   break;
-                case 8: /* full 64-bit, no mask needed */ break;
+                case 1:
+                    if (use_movzx) e.movzx_r64_r8(reg, reg);
+                    else           e.and_reg_imm32(reg, 0xFF);
+                    break;
+                case 2:
+                    if (use_movzx) e.movzx_r64_r16(reg, reg);
+                    else           e.and_reg_imm32(reg, 0xFFFF);
+                    break;
+                case 4: e.mov_reg_reg(reg, reg, false); break;
+                case 8:                                 break;
             }
         };
 
         for (int w : {widths[0], widths[1], widths[2]}) {
-            e.cmp_reg_imm32(T, w);
-            e.jcc_label(cc::z, label_of(w));
+            if (rng.pick(2)) e.poly_nop(rng);
+            emit_width_test_poly(e, rng, T, w, label_of(w));
         }
 
-        // inline default body, then jump out
+        if (rng.pick(2)) e.poly_nop(rng);
         emit_body(widths[3]);
         e.jmp_label(lbl_done);
 
-        // labeled bodies in permuted order.
         for (std::size_t i = 0; i < body_order.size(); ++i) {
             const int w = body_order[i];
             e.bind(label_of(w));
+            if (rng.pick(2)) e.poly_nop(rng);
             emit_body(w);
             if (i + 1 != body_order.size()) e.jmp_label(lbl_done);
         }
@@ -340,56 +400,90 @@ namespace mkpivm {
         e.pop_reg(T);
     }
 
-    // extract architectural register-operand value from a 64-bit slot,
-    // honoring the width byte 
-    static void emit_extract_operand(X64Emitter& e, const VMConfig& vm, std::uint8_t reg, std::uint8_t width_reg) {
-        const std::uint8_t T = pick_temp_reg(vm, 0xE107AC7117ULL, {reg, width_reg});
+    // extract architectural register-operand value from a 64-bit slot
+    static void emit_extract_operand(X64Emitter& e, const VMConfig& vm, std::uint8_t reg, std::uint8_t width_reg,
+                                     std::uint64_t call_salt = 0) {
+        const std::uint8_t T = pick_temp_reg(vm, 0xE107AC7117ULL ^ call_salt, {reg, width_reg});
         e.push_reg(T);
 
-        // shift right by 8 if the high-byte flag is set
+        SeedRng rng(vm.cipher_k1() ^ 0xE107AC7117ULL ^ 0x6B91CC03ULL ^ call_salt);
+
+        // shift right by 8 if the high-byte flag is set. and already sets ZF,
+        // so per-seed we can drop the redundant test for a smaller fingerprint.
         {
             auto lbl_no_hi = e.new_label();
             e.mov_reg_reg(T, width_reg);
+            if (rng.pick(2)) e.poly_nop(rng);
             e.and_reg_imm32(T, 0x80);
-            e.test_reg_reg(T, T);
+            if (rng.pick(2) == 0) {
+                e.test_reg_reg(T, T);
+            }
+            if (rng.pick(2)) e.poly_nop(rng);
             e.jcc_label(cc::z, lbl_no_hi);
             e.shr_reg_imm8(reg, 8);
             e.bind(lbl_no_hi);
         }
 
-        // dispatch on width.
         e.mov_reg_reg(T, width_reg);
         e.and_reg_imm32(T, 0x7F);
 
-        auto lbl_w8   = e.new_label(),
-             lbl_w4   = e.new_label(),
-             lbl_w2   = e.new_label(), 
-             lbl_done = e.new_label();
+        // permute the width cascade order per seed.
+        std::array<int, 4> widths{1, 2, 4, 8};
+        shuffle_in_place(widths, rng);
+        std::array<int, 3> body_order{widths[0], widths[1], widths[2]};
+        shuffle_in_place(body_order, rng);
 
-        e.cmp_reg_imm32(T, 8);
-        e.jcc_label(cc::z, lbl_w8);
-        e.cmp_reg_imm32(T, 4);
-        e.jcc_label(cc::z, lbl_w4);
-        e.cmp_reg_imm32(T, 2);
-        e.jcc_label(cc::z, lbl_w2);
-        
-        // width 1
-        e.and_reg_imm32(reg, 0xFF);
+        auto lbl_w1 = e.new_label(), lbl_w2 = e.new_label();
+        auto lbl_w4 = e.new_label(), lbl_w8 = e.new_label();
+        auto lbl_done = e.new_label();
+
+        auto label_of = [&](int w) {
+            switch (w) {
+                case 1:  return lbl_w1;
+                case 2:  return lbl_w2;
+                case 4:  return lbl_w4;
+                default: return lbl_w8;
+            }
+        };
+
+        auto emit_body = [&](int w) {
+            const bool use_movzx = (rng.pick(2) == 0);
+            switch (w) {
+                case 1:
+                    if (use_movzx) e.movzx_r64_r8(reg, reg);
+                    else           e.and_reg_imm32(reg, 0xFF);
+                    break;
+                case 2:
+                    if (use_movzx) e.movzx_r64_r16(reg, reg);
+                    else           e.and_reg_imm32(reg, 0xFFFF);
+                    break;
+                case 4: e.mov_reg_reg(reg, reg, false); break;
+                case 8:                                 break;
+            }
+        };
+
+        for (int w : {widths[0], widths[1], widths[2]}) {
+            if (rng.pick(2)) e.poly_nop(rng);
+            emit_width_test_poly(e, rng, T, w, label_of(w));
+        }
+
+        if (rng.pick(2)) e.poly_nop(rng);
+        emit_body(widths[3]);
         e.jmp_label(lbl_done);
-        e.bind(lbl_w2);
-        e.and_reg_imm32(reg, 0xFFFF);
-        e.jmp_label(lbl_done);
-        e.bind(lbl_w4);
-        
-        // 32-bit reg-reg mov zero-extends the top 32.
-        e.mov_reg_reg(reg, reg, false);
-        e.jmp_label(lbl_done);
-        e.bind(lbl_w8);
+
+        for (std::size_t i = 0; i < body_order.size(); ++i) {
+            const int w = body_order[i];
+            e.bind(label_of(w));
+            if (rng.pick(2)) e.poly_nop(rng);
+            emit_body(w);
+            if (i + 1 != body_order.size()) e.jmp_label(lbl_done);
+        }
+
         e.bind(lbl_done);
         e.pop_reg(T);
     }
 
-    // write value into VMState slot at slot_idx_reg 
+    // write value into VMState slot at slot_idx_reg
     static void emit_store_slot_value(X64Emitter& e, const VMConfig& vm,
                                       std::uint8_t slot_idx_reg, std::uint8_t value_reg,
                                       std::uint8_t width_reg) {
@@ -431,12 +525,15 @@ namespace mkpivm {
              lbl_w1  = e.new_label(),
              lbl_end = e.new_label();
 
-        e.cmp_reg_imm32(T_W, 8);
-        e.jcc_label(cc::z, lbl_w8);
-        e.cmp_reg_imm32(T_W, 4);
-        e.jcc_label(cc::z, lbl_w4);
-        e.cmp_reg_imm32(T_W, 2);
-        e.jcc_label(cc::z, lbl_w2);
+        {
+            SeedRng rng_ssv(vm.cipher_k1() ^ 0x5510E5511EULL);
+            if (rng_ssv.pick(2)) e.poly_nop(rng_ssv);
+            emit_width_test_poly(e, rng_ssv, T_W, 8, lbl_w8);
+            if (rng_ssv.pick(2)) e.poly_nop(rng_ssv);
+            emit_width_test_poly(e, rng_ssv, T_W, 4, lbl_w4);
+            if (rng_ssv.pick(2)) e.poly_nop(rng_ssv);
+            emit_width_test_poly(e, rng_ssv, T_W, 2, lbl_w2);
+        }
 
         // fall to width=1
         e.bind(lbl_w1);
@@ -484,56 +581,30 @@ namespace mkpivm {
         e.pop_reg(T_ADDR);
     }
 
-    // dispatch tail: fetch next opcode, look up handler offset, jump 
+    // dispatch tail
     void emit_dispatch_tail(X64Emitter& e, const VMConfig& vm) {
         const auto& r = vm.dispatcher_regs();
-        const auto& st = vm.state_layout();
+        (void)vm;
         emit_fetch_byte_dec(e, vm, r.scratch_a);
 
-        // mov scratch_b_32, dword [handler_base + scratch_a*4] zexted.
-        e.emit_rex(
-            false,
-            r.scratch_b >= 8,
-            r.scratch_a >= 8,
-            r.handler_base >= 8
-        );
-        e.u8(0x8B);
-        e.emit_modrm_mem(
-            r.scratch_b & 7,
-            r.handler_base,
+        // scratch_a = scratch_a * 5 via lea [scratch_a + scratch_a*4]
+        e.lea_reg_mem(
+            r.scratch_a,
+            r.scratch_a,
             r.scratch_a,
             2,
             0
         );
 
-        // xor with the runtime nonce to undo the per-process xor layer
-        // emit_state_init applied to the in-memory handler table
-        e.emit_rex(
-            false,
-            r.scratch_b >= 8,
-            false,
-            r.state_ptr >= 8
-        );
-        e.u8(0x33);
-        e.emit_modrm_mem(
-            r.scratch_b & 7,
-            r.state_ptr,
-            rx::none,
-            0,
-            static_cast<std::int32_t>(st.cipher_extra) + kRuntimeNonceOff
-        );
-
-        // movsxd scratch_b, scratch_b_32
-        e.movsxd_r64_r32(r.scratch_b, r.scratch_b);
-
-        // lea scratch_a, [handler_base + scratch_b]
+        // scratch_a = handler_base + scratch_a
         e.lea_reg_mem(
             r.scratch_a,
             r.handler_base,
-            r.scratch_b,
+            r.scratch_a,
             0,
             0
         );
+
         e.jmp_reg(r.scratch_a);
     }
 
@@ -566,8 +637,6 @@ namespace mkpivm {
             }
         }
     }
-
-    // codec implementations
 
     template <typename T>
     static const T& get_op(const IRInsn& i, std::size_t k) {
@@ -658,37 +727,44 @@ namespace mkpivm {
             true
         );
 
-        // rax = b xor c
+        // rax = b xor c; rax += a; rax -= d w/ poly nops
+        SeedRng rng_imm(vm.cipher_k1() ^ 0x1ABBED1E7ULL);
         e.mov_reg_mem(
             rx::rax,
             rx::rsp,
             24,
             true
         );
+        if (rng_imm.pick(2)) e.poly_nop(rng_imm);
         e.mov_reg_mem(
             rx::r10,
             rx::rsp,
             32,
             true
         );
+        if (rng_imm.pick(2)) e.poly_nop(rng_imm);
         e.xor_reg_reg(rx::rax, rx::r10, true);
 
         // rax += a
+        if (rng_imm.pick(2)) e.poly_nop(rng_imm);
         e.mov_reg_mem(
             rx::r10,
             rx::rsp,
             16,
             true
         );
+        if (rng_imm.pick(2)) e.poly_nop(rng_imm);
         e.add_reg_reg(rx::rax, rx::r10, true);
 
         // rax -= d
+        if (rng_imm.pick(2)) e.poly_nop(rng_imm);
         e.mov_reg_mem(
             rx::r10,
             rx::rsp,
             40,
             true
         );
+        if (rng_imm.pick(2)) e.poly_nop(rng_imm);
         e.sub_reg_reg(rx::rax, rx::r10, true);
 
         // store rax into the slot. IMM always overwrites the full 64
@@ -955,7 +1031,7 @@ namespace mkpivm {
         emit_fetch_u32_dec(e, vm, r.scratch_a);
         emit_fetch_byte_dec(e, vm, W);
 
-        // Compute addr in A.
+        // compute addr in A
         auto lbl_nb = e.new_label(), lbl_hb = e.new_label();
         e.cmp_reg_imm32(B, 0xFF);
         e.jcc_label(cc::nz, lbl_hb);
@@ -1098,12 +1174,15 @@ namespace mkpivm {
              lbl_w2 = e.new_label(), 
              lbl_end = e.new_label();
 
-        e.cmp_reg_imm32(W, 8);
-        e.jcc_label(cc::z, lbl_w8);
-        e.cmp_reg_imm32(W, 4);
-        e.jcc_label(cc::z, lbl_w4);
-        e.cmp_reg_imm32(W, 2);
-        e.jcc_label(cc::z, lbl_w2);
+        {
+            SeedRng rng_sc(vm.cipher_k1() ^ 0xCD05707E11ULL);
+            if (rng_sc.pick(2)) e.poly_nop(rng_sc);
+            emit_width_test_poly(e, rng_sc, W, 8, lbl_w8);
+            if (rng_sc.pick(2)) e.poly_nop(rng_sc);
+            emit_width_test_poly(e, rng_sc, W, 4, lbl_w4);
+            if (rng_sc.pick(2)) e.poly_nop(rng_sc);
+            emit_width_test_poly(e, rng_sc, W, 2, lbl_w2);
+        }
         e.mov_mem_reg_size(
             A,
             0,
@@ -1178,37 +1257,49 @@ namespace mkpivm {
         emit_fetch_u32_dec(e, vm, r.scratch_a);  // disp
         emit_fetch_byte_dec(e, vm, rx::r10);     // mem width ignored for LEA
 
-        // base value
-        auto lbl_nb = e.new_label(), lbl_hb = e.new_label();
-        e.cmp_reg_imm32(rx::rax, 0xFF);
-        e.jcc_label(cc::nz, lbl_hb);
-        e.xor_reg_reg(rx::r11, rx::r11);
-        e.jmp_label(lbl_nb);
-        e.bind(lbl_hb);
-        e.mov_reg_mem_sib(
-            rx::r11,
-            r.state_ptr, 
-            rx::rax, 
-            3,
-            static_cast<std::int32_t>(vm.state_layout().regs_base), 
-            true
-        );
-        e.bind(lbl_nb);
-        auto lbl_ni = e.new_label(), lbl_hi = e.new_label();
-        e.cmp_reg_imm32(rx::rcx, 0xFF);
-        e.jcc_label(cc::nz, lbl_hi);
-        e.xor_reg_reg(rx::rcx, rx::rcx);
-        e.jmp_label(lbl_ni);
-        e.bind(lbl_hi);
-        e.mov_reg_mem_sib(
-            rx::rcx, 
-            r.state_ptr, 
-            rx::rcx, 
-            3,
-            static_cast<std::int32_t>(vm.state_layout().regs_base), 
-            true
-        );
-        e.bind(lbl_ni);
+        // base + index slot resolve
+        SeedRng rng_lea(vm.cipher_k1() ^ 0x1EA51717ULL ^ 0xBA5E1DE3ULL);
+
+        auto emit_sentinel_load = [&](std::uint8_t slot_reg, std::uint8_t dst_reg) {
+            auto lbl_no = e.new_label(), lbl_have = e.new_label();
+            if (rng_lea.pick(2)) e.poly_nop(rng_lea);
+            e.cmp_reg_imm32(slot_reg, 0xFF);
+            e.jcc_label(cc::nz, lbl_have);
+            if (rng_lea.pick(2)) e.poly_nop(rng_lea);
+
+            // zero-init dst_reg via 32-bit form
+            switch (rng_lea.pick(3)) {
+                case 0: e.xor_reg_reg(dst_reg, dst_reg, false); break;
+                case 1: e.sub_reg_reg(dst_reg, dst_reg, false); break;
+                default: e.mov_reg_imm32(dst_reg, 0, false); break;
+            }
+            e.jmp_label(lbl_no);
+            e.bind(lbl_have);
+            if (rng_lea.pick(2)) e.poly_nop(rng_lea);
+            e.mov_reg_mem_sib(
+                dst_reg,
+                r.state_ptr,
+                slot_reg,
+                3,
+                static_cast<std::int32_t>(vm.state_layout().regs_base),
+                true
+            );
+            e.bind(lbl_no);
+        };
+
+        // per-seed, sometimes resolve index before base.
+        const bool base_first = (rng_lea.pick(2) == 0);
+        if (base_first) {
+            emit_sentinel_load(rx::rax, rx::r11);
+            if (rng_lea.pick(2)) e.poly_nop(rng_lea);
+            emit_sentinel_load(rx::rcx, rx::rcx);
+        }
+        else {
+            // index first
+            emit_sentinel_load(rx::rcx, rx::rcx);
+            if (rng_lea.pick(2)) e.poly_nop(rng_lea);
+            emit_sentinel_load(rx::rax, rx::r11);
+        }
 
         // permute the scale cascade per seed
         {
@@ -1235,8 +1326,9 @@ namespace mkpivm {
             };
 
             for (int v : {sc[0], sc[1], sc[2]}) {
-                e.cmp_reg_imm32(rx::rdx, v);
-                e.jcc_label(cc::z, label_of(v));
+                // values 1 and 2 are powers of 2 so width_test_poly can use
+                // bt+jc form
+                emit_width_test_poly(e, prng, rx::rdx, v, label_of(v));
             }
 
             emit_body(sc[3]);
@@ -1336,16 +1428,23 @@ namespace mkpivm {
             e,
             vm,
             rx::rax,
-            r.scratch_b
+            r.scratch_b,
+            (static_cast<std::uint64_t>(op) << 16) ^ 0xA01ULL
         );
 
-        // tag
+        // tag dispatch. per-seed pick imm8 vs imm32 encoding and sprinkle
+        // poly_nops so the 12-byte cmp+jz cascade signature varies.
         emit_fetch_byte_dec(e, vm, r.scratch_a);
         auto lbl_imm = e.new_label(), lbl_mem = e.new_label(), lbl_done = e.new_label();
-        e.cmp_reg_imm32(r.scratch_a, 1);
-        e.jcc_label(cc::z, lbl_imm);
-        e.cmp_reg_imm32(r.scratch_a, 2);
-        e.jcc_label(cc::z, lbl_mem);
+        {
+            SeedRng rng_tag(vm.cipher_k1() ^ 0x7A6D15FA7CULL ^ (static_cast<std::uint64_t>(op) << 4) ^
+                            static_cast<std::uint64_t>(fkind));
+            if (rng_tag.pick(2)) e.poly_nop(rng_tag);
+            emit_width_test_poly(e, rng_tag, r.scratch_a, 1, lbl_imm);
+            if (rng_tag.pick(2)) e.poly_nop(rng_tag);
+            emit_width_test_poly(e, rng_tag, r.scratch_a, 2, lbl_mem);
+            if (rng_tag.pick(2)) e.poly_nop(rng_tag);
+        }
 
         // reg: fetch slot+width, load, extract
         emit_fetch_byte_dec(e, vm, r.scratch_a);
@@ -1362,7 +1461,8 @@ namespace mkpivm {
             e,
             vm,
             rx::rcx,
-            r.scratch_b
+            r.scratch_b,
+            (static_cast<std::uint64_t>(op) << 16) ^ 0xB02ULL
         );
         e.jmp_label(lbl_done);
         e.bind(lbl_imm);
@@ -1419,19 +1519,23 @@ namespace mkpivm {
         );
         e.bind(lbl_done);
 
-        // save flag context: A = rax extracted dst, B = rcx extracted operand
-        e.mov_mem_reg(
-            r.state_ptr,
-            static_cast<std::int32_t>(vm.state_layout().flags_a),
-            rx::rax,
-            true
-        );
-        e.mov_mem_reg(
-            r.state_ptr,
-            static_cast<std::int32_t>(vm.state_layout().flags_b),
-            rx::rcx,
-            true
-        );
+        // save flag context
+        {
+            SeedRng rng_fc(vm.cipher_k1() ^ 0xBA1C0DE5ULL ^ (static_cast<std::uint64_t>(op) << 8) ^
+                           static_cast<std::uint64_t>(fkind));
+            const bool a_first = (rng_fc.pick(2) == 0);
+            if (a_first) {
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(vm.state_layout().flags_a), rx::rax, true);
+                if (rng_fc.pick(2)) e.poly_nop(rng_fc);
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(vm.state_layout().flags_b), rx::rcx, true);
+            }
+            else {
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(vm.state_layout().flags_b), rx::rcx, true);
+                if (rng_fc.pick(2)) e.poly_nop(rng_fc);
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(vm.state_layout().flags_a), rx::rax, true);
+            }
+            if (rng_fc.pick(2)) e.poly_nop(rng_fc);
+        }
 
         switch (op) {
             case BinOp::ADD:  e.add_reg_reg(rx::rax, rx::rcx); break;
@@ -1461,23 +1565,32 @@ namespace mkpivm {
             rx::rax,
             true
         );
-        e.push_reg(r.scratch_a);
-        e.push_reg(r.scratch_b);
-        e.mov_reg_imm32(rx::rdx, static_cast<std::int32_t>(fkind));
-        e.mov_mem_reg(
-            r.state_ptr,
-            static_cast<std::int32_t>(vm.state_layout().flags_op),
-            rx::rdx,
-            true
-        );
-        e.pop_reg(r.scratch_b);
-        e.pop_reg(r.scratch_a);
-        e.mov_mem_reg(
-            r.state_ptr,
-            static_cast<std::int32_t>(vm.state_layout().flags_width),
-            r.scratch_b,
-            true
-        );
+        // flags_op and flags_width writes are independent
+        {
+            SeedRng rng_fw(vm.cipher_k1() ^ 0x0DF1A65CULL ^ (static_cast<std::uint64_t>(op) << 4) ^
+                           static_cast<std::uint64_t>(fkind));
+            const bool op_first = (rng_fw.pick(2) == 0);
+            if (op_first) {
+                e.push_reg(r.scratch_a);
+                e.push_reg(r.scratch_b);
+                e.mov_reg_imm32(rx::rdx, static_cast<std::int32_t>(fkind));
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(vm.state_layout().flags_op), rx::rdx, true);
+                e.pop_reg(r.scratch_b);
+                e.pop_reg(r.scratch_a);
+                if (rng_fw.pick(2)) e.poly_nop(rng_fw);
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(vm.state_layout().flags_width), r.scratch_b, true);
+            }
+            else {
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(vm.state_layout().flags_width), r.scratch_b, true);
+                if (rng_fw.pick(2)) e.poly_nop(rng_fw);
+                e.push_reg(r.scratch_a);
+                e.push_reg(r.scratch_b);
+                e.mov_reg_imm32(rx::rdx, static_cast<std::int32_t>(fkind));
+                e.mov_mem_reg(r.state_ptr, static_cast<std::int32_t>(vm.state_layout().flags_op), rx::rdx, true);
+                e.pop_reg(r.scratch_b);
+                e.pop_reg(r.scratch_a);
+            }
+        }
         emit_store_slot_value(
             e,
             vm,
@@ -1589,8 +1702,7 @@ namespace mkpivm {
         enc_slot(out, vm, get_op<VirReg>(i, 0));
     }
 
-    static void emit_unary_arith(X64Emitter& e, const VMConfig& vm, FlagsOp fk,
-                                 void (X64Emitter::*op_reg)(std::uint8_t, bool)) {
+    static void emit_unary_arith(X64Emitter& e, const VMConfig& vm, FlagsOp fk, void (X64Emitter::*op_reg)(std::uint8_t, bool)) {
         const auto& r = vm.dispatcher_regs();
         emit_fetch_byte_dec(e, vm, r.scratch_a);
         emit_fetch_byte_dec(e, vm, r.scratch_b);
@@ -1608,7 +1720,8 @@ namespace mkpivm {
             e,
             vm,
             rx::rax,
-            r.scratch_b
+            r.scratch_b,
+            0xC1A1FULL ^ static_cast<std::uint64_t>(fk)
         );
         e.mov_mem_reg(
             r.state_ptr,
@@ -1882,10 +1995,18 @@ namespace mkpivm {
     static void emit_cmp_test_handler(X64Emitter& e, const VMConfig& vm, bool is_test) {
         const auto& r = vm.dispatcher_regs();
 
-        // op0: tag + payload
+        // op0: tag + payload. test r,r is shorter than cmp r,0 and produces
+        // the same ZF
+        SeedRng rng_ct(vm.cipher_k1() ^ 0xC714857ULL ^ (is_test ? 1ULL : 0ULL));
         emit_fetch_byte_dec(e, vm, r.scratch_a);
         auto lbl_op0_imm = e.new_label(), lbl_op0_done = e.new_label();
-        e.cmp_reg_imm32(r.scratch_a, 0);
+        if (rng_ct.pick(2)) e.poly_nop(rng_ct);
+        if (rng_ct.pick(2)) {
+            e.test_reg_reg(r.scratch_a, r.scratch_a);
+        }
+        else {
+            e.cmp_reg_imm32(r.scratch_a, 0);
+        }
         e.jcc_label(cc::nz, lbl_op0_imm);
         emit_fetch_byte_dec(e, vm, r.scratch_a); // slot
         emit_fetch_byte_dec(e, vm, r.scratch_b); // op0 width
@@ -1901,7 +2022,8 @@ namespace mkpivm {
             e,
             vm,
             rx::rax,
-            r.scratch_b
+            r.scratch_b,
+            0xC470F0ULL ^ (is_test ? 1ULL : 0ULL)
         );
         e.jmp_label(lbl_op0_done);
         e.bind(lbl_op0_imm);
@@ -1917,13 +2039,14 @@ namespace mkpivm {
         // imm carries no per-operand width, gets masked by global width below.
         e.bind(lbl_op0_done);
 
-        // op1
+        // op1 tag dispatch, same imm8 + poly_nop treatment as bin_handler.
         emit_fetch_byte_dec(e, vm, r.scratch_a);
         auto lbl_imm = e.new_label(), lbl_mem = e.new_label(), lbl_done = e.new_label();
-        e.cmp_reg_imm32(r.scratch_a, 1);
-        e.jcc_label(cc::z, lbl_imm);
-        e.cmp_reg_imm32(r.scratch_a, 2);
-        e.jcc_label(cc::z, lbl_mem);
+        if (rng_ct.pick(2)) e.poly_nop(rng_ct);
+        emit_width_test_poly(e, rng_ct, r.scratch_a, 1, lbl_imm);
+        if (rng_ct.pick(2)) e.poly_nop(rng_ct);
+        emit_width_test_poly(e, rng_ct, r.scratch_a, 2, lbl_mem);
+        if (rng_ct.pick(2)) e.poly_nop(rng_ct);
         emit_fetch_byte_dec(e, vm, r.scratch_a); // slot
         emit_fetch_byte_dec(e, vm, r.scratch_b); // op1 width
         e.mov_reg_mem_sib(
@@ -1938,7 +2061,8 @@ namespace mkpivm {
             e,
             vm,
             rx::rcx,
-            r.scratch_b
+            r.scratch_b,
+            0xC471F1ULL ^ (is_test ? 1ULL : 0ULL)
         );
         e.jmp_label(lbl_done);
         e.bind(lbl_imm);
@@ -2151,12 +2275,15 @@ namespace mkpivm {
                  lbl_w4 = e.new_label(), 
                  lbl_w2 = e.new_label();
 
-            e.cmp_reg_imm32(R_W, 8);
-            e.jcc_label(cc::z, lbl_w8);
-            e.cmp_reg_imm32(R_W, 4);
-            e.jcc_label(cc::z, lbl_w4);
-            e.cmp_reg_imm32(R_W, 2);
-            e.jcc_label(cc::z, lbl_w2);
+            {
+                SeedRng rng_brcc(vm.cipher_k1() ^ 0xB12CC7E5ULL);
+                if (rng_brcc.pick(2)) e.poly_nop(rng_brcc);
+                emit_width_test_poly(e, rng_brcc, R_W, 8, lbl_w8);
+                if (rng_brcc.pick(2)) e.poly_nop(rng_brcc);
+                emit_width_test_poly(e, rng_brcc, R_W, 4, lbl_w4);
+                if (rng_brcc.pick(2)) e.poly_nop(rng_brcc);
+                emit_width_test_poly(e, rng_brcc, R_W, 2, lbl_w2);
+            }
 
             // w1
             e.movsx_r64_r8(R_RESULT, R_RESULT);
@@ -2441,31 +2568,36 @@ namespace mkpivm {
             true
         );
 
-        // materialize x86 gprs from VMState slots 
+        // materialize x86 gprs from VMState slots
         auto sp = r.state_ptr;
         auto load_xreg_to = [&](XReg xr, std::uint8_t real_reg) {
             const std::uint8_t slot = vm.slot_of_xreg(xr);
             e.mov_reg_mem(
-                real_reg, 
+                real_reg,
                 sp,
                 static_cast<std::int32_t>(vm.state_layout().regs_base + slot * 8),
                 true
             );
         };
 
-        static constexpr XReg materialize_order[] = {
+        static constexpr XReg materialize_order_canon[] = {
             XReg::AX, XReg::CX, XReg::DX, XReg::BX, XReg::BP, XReg::SI, XReg::DI,
             XReg::R8, XReg::R9, XReg::R10, XReg::R11, XReg::R12, XReg::R13, XReg::R14, XReg::R15
         };
-        
-        static constexpr std::uint8_t real_regs[] = {
+
+        static constexpr std::uint8_t real_regs_canon[] = {
             rx::rax, rx::rcx, rx::rdx, rx::rbx, rx::rbp, rx::rsi, rx::rdi,
             rx::r8,  rx::r9,  rx::r10, rx::r11, rx::r12, rx::r13, rx::r14, rx::r15
         };
 
-        for (std::size_t k = 0; k < 15; ++k) {
-            if (real_regs[k] == sp) continue;
-            load_xreg_to(materialize_order[k], real_regs[k]);
+        SeedRng mat_rng(vm.cipher_k1() ^ 0x4A7E15A1C0DEULL);
+        std::array<std::uint8_t, 15> idx{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+        shuffle_in_place(idx, mat_rng);
+
+        for (auto k : idx) {
+            if (real_regs_canon[k] == sp) continue;
+            if (mat_rng.pick(2)) e.poly_nop(mat_rng);
+            load_xreg_to(materialize_order_canon[k], real_regs_canon[k]);
         }
 
         // load rsp last, then jmp through memory so rax isn't clobbered
@@ -2499,6 +2631,8 @@ namespace mkpivm {
 
     static void emit_native_handler(X64Emitter& e, const VMConfig& vm, bool is_jmp) {
         const auto& r = vm.dispatcher_regs();
+        // --rx mode
+        if (vm.rx_mode()) goto skip_deferred_decrypt;
         {
             // deferred data-island decrypt
             const auto& st_local = vm.state_layout();
@@ -2575,9 +2709,12 @@ namespace mkpivm {
                 0,
                 0
             );
+            SeedRng dn_rng(vm.cipher_k1() ^ 0xDEFE71EDDECULL);
             e.inc_reg(r.scratch_b, true);
+            if (dn_rng.pick(2)) e.poly_nop(dn_rng);
+
+            // dec sets ZF, no test needed
             e.dec_reg(rx::rcx, true);
-            e.test_reg_reg(rx::rcx, rx::rcx);
             e.jcc_label(cc::nz, lbl_loop);
 
             // restore ip + cipher_state.
@@ -2615,6 +2752,7 @@ namespace mkpivm {
 
             e.bind(lbl_dec_done);
         }
+        skip_deferred_decrypt:
         const auto& st = vm.state_layout();
 
         // operand stream: [u32 return_va_offset_in_data_island][u8 tgt_tag][payload]
@@ -2800,22 +2938,28 @@ namespace mkpivm {
             );
         };
 
-        // r10/r11 are still scratch above, so load them last in this pass
-        // nv-mapped first like rbx/rbp/rdi/rsi/r12..r15 except state_ptr
+        // r10/r11 are still scratch above, so load them last in this pass.
+        // nv-mapped first like rbx/rbp/rdi/rsi/r12..r15 except state_ptr.
+        // shuffle iteration order per seed + poly_nops to break the mov chain.
         auto sp = r.state_ptr;
-        static constexpr XReg materialize_order[] = {
+        static constexpr XReg materialize_order_canon[] = {
             XReg::AX, XReg::CX, XReg::DX, XReg::BX, XReg::BP, XReg::SI, XReg::DI,
             XReg::R8, XReg::R9, XReg::R10, XReg::R11, XReg::R12, XReg::R13, XReg::R14, XReg::R15
         };
 
-        static constexpr std::uint8_t real_regs[] = {
+        static constexpr std::uint8_t real_regs_canon[] = {
             rx::rax, rx::rcx, rx::rdx, rx::rbx, rx::rbp, rx::rsi, rx::rdi,
             rx::r8,  rx::r9,  rx::r10, rx::r11, rx::r12, rx::r13, rx::r14, rx::r15
         };
 
-        for (std::size_t k = 0; k < 15; ++k) {
-            if (real_regs[k] == sp) continue;
-            load_xreg_to(materialize_order[k], real_regs[k]);
+        SeedRng mat_rng(vm.cipher_k1() ^ 0x4A7E15A1C0FFULL ^ (is_jmp ? 1ULL : 0ULL));
+        std::array<std::uint8_t, 15> idx{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+        shuffle_in_place(idx, mat_rng);
+
+        for (auto k : idx) {
+            if (real_regs_canon[k] == sp) continue;
+            if (mat_rng.pick(2)) e.poly_nop(mat_rng);
+            load_xreg_to(materialize_order_canon[k], real_regs_canon[k]);
         }
 
         // range-mode mid-exec JMP_NATIVE teardown
@@ -2862,10 +3006,7 @@ namespace mkpivm {
                 true
             ); // [caller_retaddr] = target
 
-            // --range-leak-nvs. blast current VMState NV slots over the
-            // prologue stack saves so exit_handler's pop sequence picks up
-            // what the lifted range actually wrote instead of the stale,
-            // shitty caller-side values
+            // --range-leak-nvs
             if (vm.range_leak_nvs()) {
                 if (const auto* order = prologue_order_for(e)) {
                     auto host_to_xreg = [](std::uint8_t reg) -> XReg {

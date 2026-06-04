@@ -84,6 +84,12 @@ namespace mkpivm {
         std::uint16_t block_table_count{0};
         std::uint16_t trampoline_base{0};   // per-call-site trampoline region
         std::uint16_t cipher_extra{0};      // sbox and other key material
+        // --rx mode only 
+        std::uint16_t data_island_buf_off{0};
+        // --rx mode only 
+        std::uint16_t vp_addr{0};
+        // --rx mode only 
+        std::uint16_t vp_old{0};
         std::uint16_t total_size{0};
     };
 
@@ -141,6 +147,22 @@ namespace mkpivm {
             // --heap-stack toggle
             bool heap_stack() const noexcept { return heap_stack_; }
             void set_heap_stack(bool on) noexcept { heap_stack_ = on; }
+
+            // --rx toggle 
+            bool rx_mode() const noexcept { return rx_mode_; }
+            void set_rx_mode(bool on) noexcept { rx_mode_ = on; }
+
+            // --rx-loader-vp 
+            bool rx_loader_vp() const noexcept { return rx_loader_vp_; }
+            void set_rx_loader_vp(bool on) noexcept { rx_loader_vp_ = on; }
+
+            // grow VMState by `bytes` to accommodate the data-island runtime
+            // buffer
+            void set_rx_data_island_size(std::uint32_t bytes) noexcept {
+                state_.total_size = static_cast<std::uint16_t>(
+                    ((state_.data_island_buf_off + bytes) + 15u) & ~15u);
+            }
+            std::uint16_t data_island_buf_off() const noexcept { return state_.data_island_buf_off; }
 
             // size of the data island in bytes
             std::uint32_t data_island_size() const noexcept { return data_island_size_; }
@@ -206,6 +228,8 @@ namespace mkpivm {
             bool                          range_leak_nvs_{false};
             std::uint32_t                 coro_prelo_{0};
             bool                          heap_stack_{false};
+            bool                          rx_mode_{false};
+            bool                          rx_loader_vp_{false};
             std::uint32_t                 data_island_size_{0};
             std::uint32_t                 vm_sp_headroom_{0};
 

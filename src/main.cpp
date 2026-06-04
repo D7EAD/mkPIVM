@@ -74,6 +74,16 @@ namespace {
             "                        caller-stack frame room. resolves the conflict where\n"
             "                        chained API calls would otherwise have to share rsp with\n"
             "                        VM dispatcher scratch.\n"
+            "  --rx                  produce a blob runnable from RX-only memory. handler\n"
+            "                        table and block table stay plain in the blob. data\n"
+            "                        island stays encrypted at rest and is decrypted in-place\n"
+            "                        at state_init via VirtualProtect(RW)/decrypt/VirtualProtect(RX).\n"
+            "                        default: emit an in-blob PEB walker to resolve VirtualProtect.\n"
+            "  --rx-loader-vp        with --rx, skip the in-blob PEB walker. the loader is\n"
+            "                        expected to pass VirtualProtect's address in rcx x64 or\n"
+            "                        [esp+4] x86 when invoking the blob. smaller blob, no\n"
+            "                        PEB-walk fingerprint, but the blob is no longer a vanilla\n"
+            "                        function pointer.\n"
             "  --pack                packer mode: don't lift the input. wrap it as encrypted\n"
             "                        data carried by the per-seed polymorphic vm: cipher,\n"
             "                        reg shuffle, handler-table encryption, all of it. at\n"
@@ -398,8 +408,8 @@ namespace {
             bool                    is_call_target;
             bool                    is_jmp_target;
             bool                    external_entries;
-            std::uint32_t           coro_prelo_n;     // max-depth-below-initial of stack balance
-            bool                    needs_heap_stack; // range has a `jmp REG` or `jmp [MEM]`
+            std::uint32_t           coro_prelo_n;        // max-depth-below-initial of stack balance
+            bool                    needs_heap_stack;    // range has a `jmp REG` or `jmp [MEM]`
             std::set<std::uint64_t> reachable_va_starts; // dedup helper
         };
         std::vector<Candidate> cands;
@@ -407,13 +417,12 @@ namespace {
         ZydisDecoder zdec;
         if (arch == mkpivm::Arch::X64) {
             ZydisDecoderInit(&zdec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-        } else {
+        }
+        else {
             ZydisDecoderInit(&zdec, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
         }
 
-        auto analyze_range = [&](std::uint64_t start_va, std::uint64_t end_va,
-                                 std::uint32_t& out_prelo, bool& out_heap_stack)
-        {
+        auto analyze_range = [&](std::uint64_t start_va, std::uint64_t end_va, std::uint32_t& out_prelo, bool& out_heap_stack) {
             out_prelo = 0;
             out_heap_stack = false;
 
@@ -467,9 +476,7 @@ namespace {
                         break;
                     case ZYDIS_MNEMONIC_JMP:
                         // indirect jmp
-                        if (insn.operand_count_visible >= 1 &&
-                            ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
-                        {
+                        if (insn.operand_count_visible >= 1 && ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                             out_heap_stack = true;
                         }
                         break;
@@ -537,8 +544,7 @@ namespace {
             std::set<std::uint64_t> reachable;
             for (auto id : seen) reachable.insert(blocks[id].start_va);
 
-            // safety: in hybrid mode, range bytes from start+5 to end get
-            // int3-filled, the 5-byte jmp vm_entry patch occupies the first 5 
+            // safety
             bool external_entries = false;
             for (std::size_t k = 0; k < blocks.size(); ++k) {
                 if (seen.count(static_cast<std::uint32_t>(k))) continue;
@@ -573,8 +579,7 @@ namespace {
             return c.contiguous && c.has_ret && c.body_len >= 5 && !c.external_entries;
         };
 
-        // coroutine candidate: same shape as an eligible range but no ret-
-        // terminated block in the reachable subgraph 
+        // coroutine candidate 
         auto is_coroutine = [](const Candidate& c){
             return c.contiguous && !c.has_ret && c.body_len >= 5 && !c.external_entries;
         };
@@ -583,8 +588,6 @@ namespace {
             return is_eligible(c) || is_coroutine(c);
         };
 
-        // dedup: lots of jmp-targets are intra-function branch labels whose
-        // bfs reachable set is a subset of an outer function entry's 
         std::sort(
             cands.begin(), 
             cands.end(),
@@ -773,8 +776,7 @@ namespace {
 
         for (std::size_t i = 0; i < v.size(); ++i) {
             if ((i % 16) == 0) os << "\n    ";
-            os << "0x" << "0123456789abcdef"[v[i] >> 4]
-                       << "0123456789abcdef"[v[i] & 0xF];
+            os << "0x" << "0123456789abcdef"[v[i] >> 4] << "0123456789abcdef"[v[i] & 0xF];
             if (i + 1 != v.size()) os << ", ";
         }
 
@@ -787,9 +789,7 @@ namespace {
         os << "shellcode = b\"";
 
         for (auto b : v) {
-            os << "\\x"
-               << "0123456789abcdef"[b >> 4]
-               << "0123456789abcdef"[b & 0xF];
+            os << "\\x" << "0123456789abcdef"[b >> 4] << "0123456789abcdef"[b & 0xF];
         }
 
         os << "\"\n";
@@ -953,6 +953,12 @@ int main(int argc, char** argv) {
             }
             else if (a == "--heap-stack") {
                 opt.heap_stack = true;
+            }
+            else if (a == "--rx") {
+                opt.rx_mode = true;
+            }
+            else if (a == "--rx-loader-vp") {
+                opt.rx_loader_vp = true;
             }
             else if (a == "--embed-into" && i + 1 < argc) {
                 embed_target = argv[++i];

@@ -260,6 +260,5 @@ namespace mkpivm {
     VirReg zreg_to_virreg(ZydisRegister r, Width fallback = Width::Q);
     Mem    zmem_to_mem(const ZydisDecodedOperand& op, Width w);
     Imm    zimm_to_imm(const ZydisDecodedOperand& op, Width w);
-
     Width  width_from_zsize(std::uint16_t bits) noexcept;
 }

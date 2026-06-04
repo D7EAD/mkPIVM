@@ -338,6 +338,17 @@ namespace mkpivm {
         if (opt.heap_stack) {
             vm.set_heap_stack(true);
         }
+        if (opt.rx_mode) {
+            if (opt.pack_mode) {
+                throw Error("--rx is incompatible with --pack");
+            }
+            vm.set_rx_mode(true);
+            if (opt.rx_loader_vp) {
+                vm.set_rx_loader_vp(true);
+            }
+        } else if (opt.rx_loader_vp) {
+            throw Error("--rx-loader-vp requires --rx");
+        }
 
         // headroom scan
         {
@@ -554,22 +565,15 @@ namespace mkpivm {
                     if (it != return_va_to_trampoline_idx.end()) {
                         off = static_cast<std::int64_t>(trampoline_offsets[it->second]);
                     }
-                    else if (rip_via_call_set.count(tf.return_va) &&
-                             tf.return_va > opt.base_va &&
+                    else if (rip_via_call_set.count(tf.return_va) && tf.return_va > opt.base_va &&
                              tf.return_va < opt.base_va + shellcode.size) {
                         // rip-via-call: jump to the native byte, the pop reg.
                         off = static_cast<std::int64_t>(tf.return_va - opt.base_va) -
-                            static_cast<std::int64_t>(shellcode.size) -
-                            static_cast<std::int64_t>(trampoline_region_offset);
+                            static_cast<std::int64_t>(shellcode.size) - static_cast<std::int64_t>(trampoline_region_offset);
                     }
                     else if (tf.return_va > opt.base_va && tf.return_va < opt.base_va + shellcode.size) {
-                        // return_va sits in data. no cfg block, not rip-via-call.
-                        // either the api never returns, or the shellcode falls
-                        // into a string. jumping to a data byte runs garbage as
-                        // code. route to exit_handler so we bail clean if the
-                        // api does return.
-                        off = static_cast<std::int64_t>(gen.offsets().exit_handler) -
-                            static_cast<std::int64_t>(trampoline_region_offset);
+                        // return_va sits in data 
+                        off = static_cast<std::int64_t>(gen.offsets().exit_handler) - static_cast<std::int64_t>(trampoline_region_offset);
                     }
                     else {
                         off = 0;
@@ -664,22 +668,26 @@ namespace mkpivm {
                     for (int i = 0; i < 4; ++i) bytes[fx.patch_offset + i] = static_cast<std::uint8_t>(v >> (8 * i));
                 }
 
-                // resolve handler-table entries 
+                // resolve handler-table entries. each is a 5-byte E9 rel32.
                 for (std::size_t op = 0; op < 256; ++op) {
                     const auto h = gen.offsets().handler_offsets[op];
                     if (h == static_cast<std::size_t>(-1)) continue;
-                    const std::int64_t off = static_cast<std::int64_t>(h) - static_cast<std::int64_t>(gen.offsets().handler_table);
 
-                    if (off < INT32_MIN || off > INT32_MAX) throw Error("handler table entry oob");
-                    const std::uint32_t v = static_cast<std::uint32_t>(static_cast<std::int32_t>(off));
+                    const std::size_t entry_off = gen.offsets().handler_table + op * 5;
+                    const std::size_t entry_end = entry_off + 5;
+                    const std::int64_t rel = static_cast<std::int64_t>(h) - static_cast<std::int64_t>(entry_end);
+                    if (rel < INT32_MIN || rel > INT32_MAX) throw Error("handler table entry oob");
 
-                    for (int i = 0; i < 4; ++i) bytes[gen.offsets().handler_table + op * 4 + i] = static_cast<std::uint8_t>(v >> (8 * i));
+                    bytes[entry_off] = 0xE9;
+                    const std::uint32_t v = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel));
+                    for (int i = 0; i < 4; ++i) bytes[entry_off + 1 + i] = static_cast<std::uint8_t>(v >> (8 * i));
                 }
 
-                // encrypt the resolved handler table in place 
-                {
+                // encrypt the resolved handler table in place, unless --rx
+                // is on 
+                if (!opt.rx_mode) {
                     const std::size_t HT = gen.offsets().handler_table;
-                    std::vector<std::uint8_t> ht(&bytes[HT], &bytes[HT + 256 * 4]);
+                    std::vector<std::uint8_t> ht(&bytes[HT], &bytes[HT + 256 * 5]);
                     vm.encrypt_inplace(ht, {});
                     std::copy(ht.begin(), ht.end(), bytes.begin() + HT);
                 }
@@ -691,15 +699,14 @@ namespace mkpivm {
                 const std::size_t stub_base = blob.size();
                 blob.insert(blob.end(), bytes.begin(), bytes.end());
 
-                // is_code[] for the lifted range. int3-filling data bytes
-                // shits all over strings/tables that lifted LEAs still point
-                // at, so skip them. same trick as the default-mode loop below.
+                // is_code[] for the lifted range 
                 std::vector<bool> range_is_code(shellcode.size, false);
                 for (const auto& b : cfg.blocks()) {
                     const std::uint64_t s = b.start_va < opt.base_va ? 0 : (b.start_va - opt.base_va);
                     const std::uint64_t e = b.end_va  < opt.base_va ? 0 : (b.end_va   - opt.base_va);
                     for (std::uint64_t i = s; i < e && i < shellcode.size; ++i) range_is_code[i] = true;
                 }
+
                 // a string that starts on an instruction boundary the cfg
                 // wandered into looks like code. demote it back to data.
                 constexpr std::uint32_t kRangeFixupPromoteSpan = 1024;
@@ -866,8 +873,10 @@ namespace mkpivm {
         }
         const std::uint32_t block_table_count = static_cast<std::uint32_t>(block_table_pairs.size());
 
-        // encrypt block table at rest 
-        vm.encrypt_inplace(block_table_bytes, {});
+        // encrypt block table at rest, unless --rx 
+        if (!opt.rx_mode) {
+            vm.encrypt_inplace(block_table_bytes, {});
+        }
 
         // compact data region 
         std::vector<bool> is_code(shellcode.size, false);
@@ -931,7 +940,7 @@ namespace mkpivm {
             return it->second;
         };
 
-        // encrypt the data region.
+        // encrypt the data region 
         vm.encrypt_inplace(island, {});
 
         if (opt.verbose) {
@@ -1110,21 +1119,26 @@ namespace mkpivm {
                 for (int i = 0; i < 4; ++i) bytes[fx.patch_offset + i] = static_cast<std::uint8_t>(v >> (8*i));
             }
 
+            // each handler-table entry is a 5-byte `E9 rel32` jmp to the
+            // handler. rel32 is relative to the end of the jmp instruction.
             for (std::size_t op = 0; op < 256; ++op) {
                 const auto h = gen.offsets().handler_offsets[op];
                 if (h == static_cast<std::size_t>(-1)) continue;
 
-                const std::int64_t off = static_cast<std::int64_t>(h) - static_cast<std::int64_t>(gen.offsets().handler_table);
-                if (off < INT32_MIN || off > INT32_MAX) throw Error("handler table entry oob");
+                const std::size_t entry_off = gen.offsets().handler_table + op * 5;
+                const std::size_t entry_end = entry_off + 5;
+                const std::int64_t rel = static_cast<std::int64_t>(h) - static_cast<std::int64_t>(entry_end);
+                if (rel < INT32_MIN || rel > INT32_MAX) throw Error("handler table entry oob");
 
-                const std::uint32_t v = static_cast<std::uint32_t>(static_cast<std::int32_t>(off));
-                for (int i = 0; i < 4; ++i) bytes[gen.offsets().handler_table + op * 4 + i] = static_cast<std::uint8_t>(v >> (8*i));
+                bytes[entry_off] = 0xE9;
+                const std::uint32_t v = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel));
+                for (int i = 0; i < 4; ++i) bytes[entry_off + 1 + i] = static_cast<std::uint8_t>(v >> (8*i));
             }
 
-            // encrypt the resolved handler table in place 
-            {
+            // encrypt the resolved handler table in place unless --rx is on
+            if (!opt.rx_mode) {
                 const std::size_t HT = gen.offsets().handler_table;
-                std::vector<std::uint8_t> ht(&bytes[HT], &bytes[HT + 256 * 4]);
+                std::vector<std::uint8_t> ht(&bytes[HT], &bytes[HT + 256 * 5]);
                 vm.encrypt_inplace(ht, {});
                 std::copy(ht.begin(), ht.end(), bytes.begin() + HT);
             }
@@ -1145,8 +1159,8 @@ namespace mkpivm {
 
         auto rn = [](std::uint8_t r) -> const char* {
             static const char* n[] = {
-                "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
-                "r8","r9","r10","r11","r12","r13","r14","r15"
+                "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
             };
             return n[r & 15];
         };

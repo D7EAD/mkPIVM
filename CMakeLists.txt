@@ -56,9 +56,6 @@ set(MKPIVM_SOURCES
     src/pe_embed.cpp
 )
 
-add_library(mkpivm_core STATIC ${MKPIVM_SOURCES} ${MKPIVM_HEADERS})
-target_include_directories(mkpivm_core PUBLIC include)
-target_link_libraries(mkpivm_core PUBLIC Zydis::Zydis fmt::fmt)
-
-add_executable(mkpivm src/main.cpp)
-target_link_libraries(mkpivm PRIVATE mkpivm_core)
+add_executable(mkpivm src/main.cpp ${MKPIVM_SOURCES} ${MKPIVM_HEADERS})
+target_include_directories(mkpivm PRIVATE include)
+target_link_libraries(mkpivm PRIVATE Zydis::Zydis fmt::fmt)

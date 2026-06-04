@@ -350,10 +350,7 @@ namespace mkpivm {
             }
             else if (need_terminator) {
                 // last cfg block in a range mode lift falls off the end of
-                // the lifted region. without a terminator dispatch_tail
-                // happily fetches past the end of bytecode, looks up garbage
-                // in the handler table and lands on something stupid. drop
-                // a JMP_NATIVE to cb.end_va so we exit clean instead.
+                // the lifted region 
                 const std::uint64_t src_pc = blk.insns.empty() ? cb.start_va : blk.insns.back().src_pc;
                 IRInsn& ir   = builder.push(IROp::JMP_NATIVE, Width::Q);
                 ir.ops[0]    = Imm{static_cast<std::int64_t>(cb.end_va), Width::Q};
@@ -1009,14 +1006,14 @@ namespace mkpivm {
 
     std::vector<ZydisMnemonic> SetccLifter::mnemonics() const {
         return {
-            ZYDIS_MNEMONIC_SETO, ZYDIS_MNEMONIC_SETNO,
-            ZYDIS_MNEMONIC_SETB, ZYDIS_MNEMONIC_SETNB,
-            ZYDIS_MNEMONIC_SETZ, ZYDIS_MNEMONIC_SETNZ,
-            ZYDIS_MNEMONIC_SETBE,ZYDIS_MNEMONIC_SETNBE,
-            ZYDIS_MNEMONIC_SETS, ZYDIS_MNEMONIC_SETNS,
-            ZYDIS_MNEMONIC_SETP, ZYDIS_MNEMONIC_SETNP,
-            ZYDIS_MNEMONIC_SETL, ZYDIS_MNEMONIC_SETNL,
-            ZYDIS_MNEMONIC_SETLE,ZYDIS_MNEMONIC_SETNLE,
+            ZYDIS_MNEMONIC_SETO,  ZYDIS_MNEMONIC_SETNO,
+            ZYDIS_MNEMONIC_SETB,  ZYDIS_MNEMONIC_SETNB,
+            ZYDIS_MNEMONIC_SETZ,  ZYDIS_MNEMONIC_SETNZ,
+            ZYDIS_MNEMONIC_SETBE, ZYDIS_MNEMONIC_SETNBE,
+            ZYDIS_MNEMONIC_SETS,  ZYDIS_MNEMONIC_SETNS,
+            ZYDIS_MNEMONIC_SETP,  ZYDIS_MNEMONIC_SETNP,
+            ZYDIS_MNEMONIC_SETL,  ZYDIS_MNEMONIC_SETNL,
+            ZYDIS_MNEMONIC_SETLE, ZYDIS_MNEMONIC_SETNLE,
         };
     }
 

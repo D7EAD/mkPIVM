@@ -41,6 +41,12 @@ namespace mkpivm {
         // stack region instead of running on top of the host's real
         // stack.
         bool heap_stack{false};
+
+        // --rx 
+        bool rx_mode{false};
+
+        // --rx-loader-vp 
+        bool rx_loader_vp{false};
     };
 
     struct PackageResult {

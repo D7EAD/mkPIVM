@@ -48,7 +48,7 @@ namespace mkpivm {
         cur = static_cast<std::uint16_t>(cur + state_.regs_total_bytes);
 
         // scalar fields, placed in random order.
-        enum Field { F_OP, F_A, F_B, F_RES, F_W, F_DF, F_CSP, F_RSP, F_BCB, F_DIB, F_BTB, F_BTC, F_TRB, F_EXT, F_CSB, F_END };
+        enum Field { F_OP, F_A, F_B, F_RES, F_W, F_DF, F_CSP, F_RSP, F_BCB, F_DIB, F_BTB, F_BTC, F_TRB, F_EXT, F_CSB, F_VP, F_VPO, F_END };
         std::array<std::uint8_t, F_END> order{};
         for (std::uint8_t i = 0; i < F_END; ++i) order[i] = i;
         shuffle_in_place(order, rng);
@@ -72,6 +72,8 @@ namespace mkpivm {
                 case F_TRB: state_.trampoline_base   = cur; cur += 8;   break;
                 case F_EXT: state_.cipher_extra      = cur; cur += 768; break; // cipher constants, s-box, scratch
                 case F_CSB: state_.call_stack_base   = cur; cur += 0;   break; // real size set below
+                case F_VP:  state_.vp_addr           = cur; cur += 8;   break;
+                case F_VPO: state_.vp_old            = cur; cur += 8;   break; // 8B alloc for DWORD &old_protect
                 default:                                                break;
             }
         }
@@ -81,6 +83,9 @@ namespace mkpivm {
         cur = pad(cur, 16);
         state_.call_stack_base = cur;
         cur += static_cast<std::uint16_t>(call_stack_depth_ * 8);
+
+        // --rx mode 
+        state_.data_island_buf_off = cur;
 
         state_.total_size = pad(cur, 16);
 
