@@ -1,5 +1,3 @@
-> Working on polymorphism improvements, will push sooner or later
-
 <p align="center">
   <img src="./images/mkpivm.png" width="30%" height="30%">
   <br>
@@ -29,7 +27,7 @@ I got the receipts. You can see a video of mkPIVM in action below, fully virtual
 
 See it [here](https://github.com/D7EAD/mkPIVM/raw/refs/heads/main/media/mkpivm-showcase.mp4). Hosted in ./media, can't embed sadly.
 
-Here is the VirusTotal report for that exact virtualized sample (as of 05/27/2026).
+Here is the VirusTotal report for that exact virtualized sample (as of 06/04/2026).
 
 <img src="./images/vt.png">
 
@@ -61,6 +59,8 @@ There was careful attention paid to the entropy telemetry of the output of this 
 | Stacked | `--pack --ranges A:B` | Build the hybrid blob, then pack-wrap it. |
 | Detour | `--embed-into PE --at RVA` | Take a pre-built blob, embed into a PE, patch a jmp at the chosen RVA. |
 | Scan | `--scan` | Print eligible `--ranges` candidates from the input's CFG, then exit. |
+| RX | `--rx` | PAGE_EXECUTE_READ blob. Data island stays encrypted at rest; in-blob PEB walker resolves VirtualProtect, decrypts in-place at state_init. |
+| RX w/ Loader | `--rx --rx-loader-vp` | Like `--rx` but your loader passes VirtualProtect in as the blob's first arg. No PEB walker. |
 
 Every mode honors `--seed`, `--arch`, `--input-format`, and `--format`. See the per-mode sections below for the build pipeline and the runtime flow.
 
