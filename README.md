@@ -70,7 +70,7 @@ The lifter walks the whole CFG and lowers every instruction to a custom IR. The 
 
 ### Build pipeline
 
-Steps the build performs to turn raw shellcode into the emitted virtualized blob, end to end.
+Steps the build performs to turn raw shellcode into the emitted virtualized blob, end to end. _All graphs below apply to the 1.0.0 release, these have changed since then, but the idea is the same._
 
 ```mermaid
 flowchart TB
