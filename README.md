@@ -3,7 +3,7 @@
 <p align="center">
   <img src="./images/mkpivm.png" width="30%" height="30%">
   <br>
-  <a href="./research/mkpivm-research.pdf">Read</a> the research paper.
+  <a href="./research/mkpivm-research.pdf">Read</a> the research paper (written for 1.0.0).
 </p>
 
 **mkPIVM** is a polymorphic position-independent shellcode virtualizer for Windows x86 and x64 (Linux soon).
