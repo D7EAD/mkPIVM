@@ -36,6 +36,10 @@ Here is the VirusTotal report for that exact virtualized sample (as of 06/04/202
 
 <img src="./images/packed.png">
 
+Here is a normal Cobalt Strike beacon's results for comparison.
+
+<img src="./images/normal_beacon.png">
+
 There was careful attention paid to the entropy telemetry of the output of this tool, which results in shellcode of entropy less than typical Windows WinAPI DLLs (outside of packing mode), such as ntdll.dll or kernel32.dll. The entropy comparison is about...
 
 | File | Bytes | Entropy |
