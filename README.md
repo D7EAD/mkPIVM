@@ -12,7 +12,6 @@ Why: native shellcode is signature-trivial. Wrapping it in a per-instance VM wit
 
 ## Related Work & Plans
 * Linux support will be added soon.
-* New related project dropping soon.
 
 ## Quick start
 
