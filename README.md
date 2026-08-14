@@ -2,6 +2,9 @@
   <img src="./images/mkpivm.png" width="30%" height="30%">
   <br>
   <a href="./research/mkpivm-research.pdf">Read</a> the research paper (written for 1.0.0).
+  <p align="center">
+    mkPIVM payloads have remained fully undetected since the release of this project.
+  </p>
 </p>
 
 **mkPIVM** is a polymorphic position-independent shellcode virtualizer for Windows x86 and x64 (Linux soon).
